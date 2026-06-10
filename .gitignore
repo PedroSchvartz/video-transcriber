@@ -5,3 +5,18 @@ _test_*
 _cache/
 _output/
 _run_real.py
+
+# Ambientes virtuais
+.venv/
+venv/
+
+# Logs
+*.log
+
+# Configs de IDE
+.idea/
+.vscode/
+
+# Lixo de SO
+.DS_Store
+Thumbs.db
