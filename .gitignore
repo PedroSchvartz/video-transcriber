@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+_test_*
+_cache/
+_output/
+_run_real.py

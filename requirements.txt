@@ -1,0 +1,16 @@
+mcp>=1.0.0          # SDK do MCP server
+yt-dlp              # Download YouTube / Instagram + metadados/capitulos
+groq                # Whisper Large v3 Turbo (216x realtime, free tier)
+faster-whisper      # Fallback local (arquivo grande ou sem chave Groq)
+imagehash           # pHash para deduplicar frames quase identicos
+Pillow              # Manipulacao de imagens
+numpy               # Medida de nitidez (variancia do Laplaciano) na escolha do frame
+python-dotenv       # Carrega GROQ_API_KEY do .env
+
+# --- Anotacao OPCIONAL dos prints (--ocr / --describe). Pesadas (o Florence-2
+# puxa torch); instale so se for usar. Sem elas, o passo e pulado com aviso. ---
+# rapidocr-onnxruntime   # OCR local (texto na tela) — leve, ONNX
+# transformers           # Florence-2 (descricao dos prints)
+# torch                  # backend do Florence-2 (~2GB)
+# timm                   # exigido pelo Florence-2
+# einops                 # exigido pelo Florence-2
