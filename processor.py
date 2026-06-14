@@ -23,6 +23,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import ffmpeg_tools
+import config
 import frame_annotators as fa
 import frame_selector as fs
 
@@ -47,13 +48,15 @@ AUDIO_BITRATE = "24k"                # Opus p/ Whisper: ~16MB em 90min, cabe num
 # VERTICAL o height e a dimensao ALTA (1080x1920 tem height=1920), entao height<=720
 # capava reels a 360p. res:N usa min(w,h), entao 1080 = "1080p" nas duas orientacoes.
 DOWNLOAD_RES = 1080
-MAX_DURATION_HARD = 4 * 3600         # recusa videos absurdamente longos (>4h) por seguranca
+_cfg = config.load()  # lido apos load_dotenv(); reflete .env + config.json
+MAX_DURATION_HARD = _cfg["max_duration_hours"] * 3600
+SILENCE_THRESHOLD_DBFS = _cfg["silence_threshold_dbfs"]
 
 # Cache persistente: cada video processado vira uma pasta com video + transcript
 # + frames + meta.json. Permite reler o artefato e capturar frames sob demanda
 # (get_frame) em conversas posteriores, sem reprocessar.
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_cache")
-MAX_CACHE_ENTRIES = 10               # mantem os N videos mais recentes (limpeza LRU)
+MAX_CACHE_ENTRIES = _cfg["max_cache_entries"]
 
 # Windows: o worker roda destacado (sem console proprio), entao cada ffmpeg/ffprobe
 # filho ganharia uma janela de console nova que pisca na tela. CREATE_NO_WINDOW
@@ -338,6 +341,25 @@ def _slice_audio(audio_path: str, start: float, dur: float, workdir: str, idx: i
 # ===========================================================================
 # Transcricao
 # ===========================================================================
+def _audio_mean_volume(audio_path: str) -> "float | None":
+    """Mede o volume medio do audio (dBFS) via ffmpeg volumedetect.
+
+    Retorna None em qualquer falha — fail-safe: em caso de duvida, transcreve.
+    """
+    try:
+        proc = _run_ffmpeg([
+            "ffmpeg", "-hide_banner", "-i", audio_path,
+            "-af", "volumedetect", "-f", "null", "-",
+        ], timeout=60)
+        for line in proc.stderr.splitlines():
+            if "mean_volume" in line:
+                # "[Parsed_volumedetect_0 @ ...] mean_volume: -56.3 dBFS"
+                return float(line.split("mean_volume:")[1].strip().split()[0])
+    except Exception:
+        pass
+    return None
+
+
 def _empty_transcript() -> dict:
     return {"text": "", "segments": [], "words": [], "engine": None}
 
@@ -494,6 +516,14 @@ def transcribe_local(audio_path: str) -> dict:
 def transcribe(audio_path: str | None, workdir: str) -> dict:
     """Escolhe o motor de transcricao disponivel e normaliza a saida."""
     if audio_path is None:
+        return _empty_transcript()
+    vol = _audio_mean_volume(audio_path)
+    if vol is not None and vol < SILENCE_THRESHOLD_DBFS:
+        log.info(
+            "Audio praticamente silencioso (mean_volume=%.1f dBFS < %.0f); "
+            "pulando transcricao para evitar alucinacoes do Whisper.",
+            vol, SILENCE_THRESHOLD_DBFS,
+        )
         return _empty_transcript()
     if os.environ.get("GROQ_API_KEY"):
         try:

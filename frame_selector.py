@@ -21,6 +21,8 @@ import subprocess
 import time
 from dataclasses import dataclass
 
+import config
+
 log = logging.getLogger("video_transcriber.frames")
 
 # Windows: suprime a janela de console que cada ffmpeg piscaria na tela quando o
@@ -62,9 +64,9 @@ DEDUP_T_COR = 50.0           # distancia de cor p/ contar um pixel como "diferen
 DIRTY_DUP_LOW = 0.02         # < 2% diferente -> quase identicos -> duplicata
 DIRTY_DUP_VETO = 0.10        # pHash so funde se < 10% diferente (senao e outro conteudo)
 
-# Budget de prints proporcional a duracao (ver screenshot_budget):
-MIN_PER_MINUTE = 1           # piso de prints por minuto de video (no minimo 1)
-MAX_PER_MINUTE = 12          # teto de prints por minuto de video
+# Budget de prints proporcional a duracao (ver screenshot_budget).
+# Defaults: MIN=1, MAX=12. Configuravel via VT_MIN/MAX_FRAMES_PER_MINUTE ou config.json.
+# MAX=9999 desativa o teto (sem limite de prints por minuto).
 
 # Custo/seguranca em videos longos:
 SCENE_SCALE_WIDTH = 192      # downscale antes do filtro de cena (calculo mais barato)
@@ -411,15 +413,19 @@ def cap_uniform(marks: list[FrameMark], max_count: int) -> list[FrameMark]:
 def screenshot_budget(requested: int, duration: float) -> int:
     """Ajusta o numero de prints a duracao do video.
 
-    Piso de MIN_PER_MINUTE por minuto (no minimo 1, mesmo em videos < 1 min) e
-    teto de MAX_PER_MINUTE por minuto. O valor pedido e encaixado nessa faixa:
-    garante cobertura minima em videos longos sem explodir em prints em videos
-    curtos. Ex.: video de 1 min -> [1, 12]; de 5 min -> [5, 60].
+    Piso de min_fpm por minuto (no minimo 1, mesmo em videos < 1 min) e teto de
+    max_fpm por minuto. O valor pedido e encaixado nessa faixa. max_fpm >= 9999
+    desativa o teto — o pipeline usa o numero pedido sem cap por minuto.
+    Ex. padrao: video de 1 min -> [1, 12]; de 5 min -> [5, 60].
     """
+    cfg = config.get()
+    min_fpm = cfg["min_frames_per_minute"]
+    max_fpm = cfg["max_frames_per_minute"]
     minutes = max(1, math.ceil((duration or 0) / 60))
-    floor = MIN_PER_MINUTE * minutes
-    ceil = MAX_PER_MINUTE * minutes
-    return max(floor, min(int(requested), ceil))
+    floor = min_fpm * minutes
+    if max_fpm >= 9999:
+        return max(floor, int(requested))
+    return max(floor, min(int(requested), max_fpm * minutes))
 
 
 def fill_to_budget(smart: list[FrameMark], duration: float, max_count: int) -> list[FrameMark]:

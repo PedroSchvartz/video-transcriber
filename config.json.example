@@ -1,0 +1,10 @@
+{
+  "_comentario": "Copie este arquivo para config.json e ajuste os valores. Opcional.",
+
+  "min_frames_per_minute": 1,
+  "max_frames_per_minute": 12,
+
+  "max_duration_hours": 4.0,
+  "max_cache_entries": 10,
+  "silence_threshold_dbfs": -50.0
+}

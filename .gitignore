@@ -5,6 +5,7 @@ _test_*
 _cache/
 _output/
 _run_real.py
+_prescan.py
 
 # Ambientes virtuais
 .venv/

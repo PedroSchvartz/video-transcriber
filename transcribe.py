@@ -24,6 +24,7 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
+import config  # noqa: E402
 import processor  # noqa: E402
 
 # Logs do pipeline (engine de transcricao, limiar de cena auto-calibrado, dedup)
@@ -110,6 +111,39 @@ def _ask_screenshots(default: int) -> int:
     except ValueError:
         print(f"  valor invalido; usando {default}")
         return default
+
+
+def _ask_fpm_limits() -> tuple[int, int]:
+    """Pergunta os limites de prints/min no modo interativo. Retorna (min_fpm, max_fpm).
+
+    Enter = usa o valor atual (do .env / config.json / default).
+    0 em max = sem limite (internamente 9999).
+    """
+    cfg = config.get()
+    cur_min = cfg["min_frames_per_minute"]
+    cur_max = cfg["max_frames_per_minute"]
+    cur_max_label = "sem limite" if cur_max >= 9999 else str(cur_max)
+
+    print("Limites de prints por minuto de video (Enter = usar valor atual):")
+    try:
+        raw_min = input(f"  Min por minuto [{cur_min}]: ").strip()
+        min_fpm = int(raw_min) if raw_min else cur_min
+    except (EOFError, KeyboardInterrupt, ValueError):
+        min_fpm = cur_min
+
+    try:
+        raw_max = input(f"  Max por minuto [{cur_max_label}] (0 = sem limite): ").strip()
+        if raw_max == "0":
+            max_fpm = 9999
+        elif raw_max:
+            max_fpm = int(raw_max)
+        else:
+            max_fpm = cur_max
+    except (EOFError, KeyboardInterrupt, ValueError):
+        max_fpm = cur_max
+
+    min_fpm = max(1, min_fpm)
+    return min_fpm, max_fpm
 
 
 def _ask_yes_no(prompt: str, default: bool = False) -> bool:
@@ -241,7 +275,14 @@ def main() -> None:
                         help="URL do YouTube/Instagram ou caminho .mp4 "
                              "(se omitido, e pedido interativamente no terminal)")
     parser.add_argument("-s", "--screenshots", type=int, default=20,
-                        help="prints desejados (encaixado em 1-12 por minuto de video; padrao 20)")
+                        help="prints desejados (encaixado nos limites por minuto; padrao 20)")
+    parser.add_argument("--no-limit", action="store_true",
+                        help="remove o teto de prints por minuto (usa o valor de -s sem cap)")
+    parser.add_argument("--min-fpm", type=int, default=None, metavar="N",
+                        help="piso de prints por minuto (sobrepoe VT_MIN_FRAMES_PER_MINUTE)")
+    parser.add_argument("--max-fpm", type=int, default=None, metavar="N",
+                        help="teto de prints por minuto (sobrepoe VT_MAX_FRAMES_PER_MINUTE; "
+                             "0 ou 9999 = sem limite)")
     parser.add_argument("--ocr", action="store_true",
                         help="extrai o TEXTO na tela dos prints (RapidOCR, local/gratuito)")
     parser.add_argument("--describe", action="store_true",
@@ -250,6 +291,15 @@ def main() -> None:
                         help="backend da descricao: auto (mede a RAM; local se folgada, senao Groq), "
                              "local (Florence-2; pede permissao se apertado) ou online (Groq vision)")
     args = parser.parse_args()
+
+    # Aplica overrides de limites por minuto ANTES de qualquer import do pipeline,
+    # para que config.get() os enxergue quando screenshot_budget() for chamado.
+    if args.no_limit or args.max_fpm in (0, 9999):
+        os.environ["VT_MAX_FRAMES_PER_MINUTE"] = "9999"
+    elif args.max_fpm is not None:
+        os.environ["VT_MAX_FRAMES_PER_MINUTE"] = str(args.max_fpm)
+    if args.min_fpm is not None:
+        os.environ["VT_MIN_FRAMES_PER_MINUTE"] = str(max(1, args.min_fpm))
 
     # Dois modos: fonte ja no comando, ou modo interativo (sem argumento) - pergunta
     # a URL/caminho ao usuario, insistindo ate vir algo, o numero de prints e as
@@ -261,6 +311,12 @@ def main() -> None:
         print("Video Transcriber (sem IA)\n")
         source = force_input("Cole a URL (YouTube/Instagram) ou o caminho do .mp4: ")
         screenshots = _ask_screenshots(screenshots)
+        # Perguntar limites so em modo interativo e se o usuario nao passou flags
+        if args.min_fpm is None and args.max_fpm is None and not args.no_limit:
+            print()
+            min_fpm, max_fpm = _ask_fpm_limits()
+            os.environ["VT_MIN_FRAMES_PER_MINUTE"] = str(min_fpm)
+            os.environ["VT_MAX_FRAMES_PER_MINUTE"] = str(max_fpm)
         do_ocr = _ask_yes_no("Extrair o texto na tela dos prints (OCR)?", do_ocr)
         want_describe = _ask_yes_no("Gerar descricao do conteudo dos prints?", want_describe)
         print()
