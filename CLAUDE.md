@@ -78,9 +78,19 @@ Definida em `tools/video_transcriber/.env` — **nunca commitar** (está no `.gi
 Docs de apoio: `README.md` (visão geral da ferramenta) e `USO_SEM_IA.md` (uso da CLI no
 terminal, sem IA).
 
+## Análise / experimentação (fora do pipeline)
+
+| Arquivo | Papel |
+|---------|-------|
+| `metrics_dump.py` | Batch de métricas sobre uma **coleção** de vídeos → 1 linha CSV por vídeo (~45 colunas), para tirar conclusões com dados. **Fase A** (sem chave, ~s/vídeo): container, áudio (volume/silêncio), assinatura de mudança por blocos (rest/static/localização/recorrência), brilho, proxy de texto (bordas) e de movimento global (correlação de fase). **Fase B** (`--transcript`/`--vision`/`--all`, usa `GROQ_API_KEY`, **envia ao Groq**): words/min + cobertura de fala; categoria + rosto + texto (1 chamada de visão/vídeo sobre colagem). Uso: `python metrics_dump.py <pasta \| lista.txt \| vídeos> [-o saida.csv] [--all]`. |
+
+Serve para investigar **quando** uma futura "ferramenta de foco" seria útil: a classe
+foco (ex.: xadrez) se identifica pela **convergência** de sinais (rest alto + tela
+estática + câmera parada + categoria semântica), não por um limiar único.
+
 ## Não mexa
 
 - **`_cache/`** — artefatos gerados (vídeos, frames, transcripts, `meta.json`,
   `result.json`, timings). Nunca commitar, nunca editar à mão.
-- **`_test_*` / `_run_real.py`** — scripts de teste avulsos, fora do pipeline.
+- **`_test_*` / `_run_real.py` / `_prescan.py`** — scripts de teste/diagnóstico avulsos, fora do pipeline (no `.gitignore`).
 - **`.env`** — contém `GROQ_API_KEY`. Nunca commitar.
