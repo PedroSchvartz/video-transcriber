@@ -9,7 +9,7 @@ Uso:
 
   <pasta>      -> varre videos (mp4/mkv/webm/mov/avi/m4v) recursivamente
   <lista.txt>  -> um caminho/URL por linha (# = comentario)
-  <video...>   -> um ou mais caminhos diretos
+  <video...>   -> um ou mais caminhos locais ou URLs (YouTube/Instagram via yt-dlp)
 
 Fase A (sem chave/modelo): container (ffprobe) + audio (volume/silencio) +
 assinatura de mudanca por blocos + brilho + proxy de densidade de texto (bordas)
@@ -48,6 +48,10 @@ HIST_COLS = ["hist_lt02", "hist_02_05", "hist_05_1", "hist_1_2",
              "hist_2_5", "hist_5_10", "hist_10_20", "hist_gt20"]
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
+
+
+def _is_url(s: str) -> bool:
+    return s.startswith(("http://", "https://", "www."))
 
 
 def probe_container(path: str) -> dict:
@@ -348,28 +352,43 @@ def vision_metrics(source: str, duration: float) -> dict:
 
 def compute_metrics(source: str, do_transcript: bool = False,
                     do_vision: bool = False) -> dict:
-    """Linha de metricas de UM video. Erros por fase viram coluna '*_error'."""
-    row = {"source": source, "name": os.path.basename(source)}
+    """Linha de metricas de UM video (caminho local ou URL). Erros por fase viram
+    coluna '*_error'. URLs sao baixadas via yt-dlp para um temp e medidas localmente."""
+    row = {"source": source, "name": os.path.basename(source.rstrip("/")) or source}
+    dl_dir = None
     dur = 0.0
-    try:  # Fase A (sem chave): container + audio + assinatura + proxies
-        cont = probe_container(source)
-        row.update(cont)
-        dur = cont.get("duration_s") or 0.0
-        if cont.get("has_audio"):
-            row.update(audio_metrics(source, dur))
-        row.update(change_signature(source))
-    except Exception as e:  # um video ruim nao derruba o batch
-        row["error"] = f"{type(e).__name__}: {e}"
-    if do_transcript and row.get("has_audio"):
-        try:
-            row.update(transcript_metrics(source, dur))
+    try:
+        local = source
+        if _is_url(source):  # baixa para um temp (limpo no finally)
+            import processor
+            dl_dir = tempfile.mkdtemp(prefix="vtm_dl_")
+            local, info = processor.download_or_locate(source, dl_dir)
+            if isinstance(info, dict) and info.get("title"):
+                row["name"] = info["title"]
+        try:  # Fase A (sem chave): container + audio + assinatura + proxies
+            cont = probe_container(local)
+            row.update(cont)
+            dur = cont.get("duration_s") or 0.0
+            if cont.get("has_audio"):
+                row.update(audio_metrics(local, dur))
+            row.update(change_signature(local))
         except Exception as e:
-            row["transcript_error"] = f"{type(e).__name__}: {e}"
-    if do_vision:
-        try:
-            row.update(vision_metrics(source, dur))
-        except Exception as e:
-            row["vision_error"] = f"{type(e).__name__}: {e}"
+            row["error"] = f"{type(e).__name__}: {e}"
+        if do_transcript and row.get("has_audio"):
+            try:
+                row.update(transcript_metrics(local, dur))
+            except Exception as e:
+                row["transcript_error"] = f"{type(e).__name__}: {e}"
+        if do_vision:
+            try:
+                row.update(vision_metrics(local, dur))
+            except Exception as e:
+                row["vision_error"] = f"{type(e).__name__}: {e}"
+    except Exception as e:  # falha no download/resolucao da fonte
+        row["error"] = f"download: {type(e).__name__}: {e}"
+    finally:
+        if dl_dir:
+            shutil.rmtree(dl_dir, ignore_errors=True)
     return row
 
 
