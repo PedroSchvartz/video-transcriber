@@ -83,10 +83,15 @@ terminal, sem IA).
 | Arquivo | Papel |
 |---------|-------|
 | `metrics_dump.py` | Batch de métricas sobre uma **coleção** de vídeos → 1 linha CSV por vídeo (~45 colunas), para tirar conclusões com dados. **Fase A** (sem chave, ~s/vídeo): container, áudio (volume/silêncio), assinatura de mudança por blocos (rest/static/localização/recorrência), brilho, proxy de texto (bordas) e de movimento global (correlação de fase). **Fase B** (`--transcript`/`--vision`/`--all`, usa `GROQ_API_KEY`, **envia ao Groq**): words/min + cobertura de fala; categoria + rosto + texto (1 chamada de visão/vídeo sobre colagem). Uso: `python metrics_dump.py <pasta \| lista.txt \| vídeos> [-o saida.csv] [--all]`. |
+| `focus_locator.py` | Localizador de foco por **trecho** (não por vídeo): desliza uma janela e emite **spans de foco rotulados** (`estatico` / `slide_pip`) com a região estudável (bbox) e flag `suspeito_card`. Reusa os primitivos do `metrics_dump` (mesmo scan por blocos). Resolve dois pontos cegos do escalar por vídeo: granularidade (vídeo que troca de regime) e estrutura **espacial** (`slide_pip` = canvas estudável com distrator localizado, ex.: aula com webcam num canto, que derruba o `rest` global). `--vision` (opt-in, **envia ao Groq**) confirma cada span (slide com conteúdo vs card morto). API: `locate_focus_spans(source)`. Uso: `python focus_locator.py <URL \| vídeo> [--json out.json] [--vision]`. |
 
-Serve para investigar **quando** uma futura "ferramenta de foco" seria útil: a classe
-foco (ex.: xadrez) se identifica pela **convergência** de sinais (rest alto + tela
-estática + câmera parada + categoria semântica), não por um limiar único.
+Servem para investigar **quando** uma futura "ferramenta de foco" seria útil. **Tese-mãe:**
+"foco" não está nos pixels — está na relação intenção↔conteúdo; há resposta certa só nos
+extremos (puro-dinâmico = não-foco), no meio dissolve. A ferramenta deve **localizar e
+rotular** candidatos (`focus_locator`), não fazer gatekeeping. Hierarquia de sinais
+(validada n=31 + 3 vídeos de transição): `rest`/`d_mean` por janela **decidem**;
+`static_blocks`/`bbox` (espacial) e a visão (semântico — `rest` mede imobilidade, não
+informatividade) **confirmam**.
 
 ## Não mexa
 

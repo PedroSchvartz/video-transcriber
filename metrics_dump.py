@@ -276,15 +276,21 @@ VISION_PROMPT = (
 )
 
 
-def _montage_bytes(source: str, duration: float, n: int = 6, cell_w: int = 360):
-    """Extrai n quadros espacados e monta uma colagem 3xN -> bytes JPEG (ou None)."""
+def _montage_bytes(source: str, duration: float, n: int = 6, cell_w: int = 360,
+                   start: float = 0.0, end: float | None = None):
+    """Extrai n quadros espacados e monta uma colagem 3xN -> bytes JPEG (ou None).
+    start/end limitam a amostragem a uma sub-janela [start,end] (default = video
+    inteiro), p/ amostrar de dentro de um span especifico."""
     from PIL import Image
     ffmpeg_tools.ensure_on_path()
+    lo = start or 0.0
+    hi = end if end is not None else (duration or 0.0)
+    span = hi - lo if hi > lo else 0.0
     wd = tempfile.mkdtemp(prefix="vtm_mon_")
     thumbs = []
     try:
         for i in range(n):
-            t = duration * (i + 1) / (n + 1) if duration else 0.0
+            t = lo + span * (i + 1) / (n + 1) if span > 0 else lo
             out = os.path.join(wd, f"f{i}.jpg")
             subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                             "-ss", f"{t:.2f}", "-i", source, "-frames:v", "1",
@@ -314,13 +320,15 @@ def _montage_bytes(source: str, duration: float, n: int = 6, cell_w: int = 360):
         shutil.rmtree(wd, ignore_errors=True)
 
 
-def vision_metrics(source: str, duration: float) -> dict:
-    """Categoria semantica + flags rosto/texto via 1 chamada Groq vision sobre colagem."""
+def vision_metrics(source: str, duration: float,
+                   start: float = 0.0, end: float | None = None) -> dict:
+    """Categoria semantica + flags rosto/texto via 1 chamada Groq vision sobre colagem.
+    start/end restringem a amostragem da colagem a uma sub-janela (default = inteiro)."""
     import frame_annotators as fa
     if not fa.groq_vision_available():
         return {"vision_error": "sem groq/GROQ_API_KEY"}
     try:
-        data = _montage_bytes(source, duration)
+        data = _montage_bytes(source, duration, start=start, end=end)
     except Exception as e:
         return {"vision_error": f"colagem: {type(e).__name__}"}
     if not data:
