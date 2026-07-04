@@ -78,9 +78,8 @@ def _meaningful(text: str) -> bool:
     return False
 
 
-def ocr_image(path: str) -> str:
-    """Texto na tela em ordem de leitura (topo->baixo). '' se nada legivel."""
-    out = _get_ocr()(path)
+def _ocr_text(out) -> str:
+    """Junta o texto legivel de uma saida do RapidOCR (API classica ou nova)."""
     # API classica: (result, elapse) com result = [[box, text, score], ...] | None
     if isinstance(out, tuple):
         result = out[0]
@@ -93,6 +92,24 @@ def ocr_image(path: str) -> str:
     if not txts:
         return ""
     return " ".join(t for raw in txts if _meaningful(t := (raw or "").strip())).strip()
+
+
+def ocr_image(path: str) -> str:
+    """Texto na tela em ordem de leitura (topo->baixo). '' se nada legivel."""
+    return _ocr_text(_get_ocr()(path))
+
+
+def ocr_region(frame, bbox) -> str:
+    """Texto DENTRO de uma bbox (x0,y0,x1,y1) de um frame RGB (ndarray). '' se nada.
+
+    Recorta a zona e roda o mesmo motor do ocr_image. Serve o screen_match: ler so o
+    texto do que MUDOU numa tela, nao a tela toda."""
+    import numpy as np
+    x0, y0, x1, y1 = (int(v) for v in bbox)
+    crop = np.ascontiguousarray(frame[y0:y1, x0:x1])
+    if crop.size == 0:
+        return ""
+    return _ocr_text(_get_ocr()(crop))
 
 
 # --- Descricao: backend local (Florence-2) ou nuvem (Groq vision) ----------
