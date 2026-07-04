@@ -28,6 +28,7 @@ Prioridade: **P0** (impacto alto, esforço baixo) · **P1** (alto impacto) · **
 | 10 | **Fallback de modelo Groq vision** | `frame_annotators.py` | Se `llama-4-scout` não estiver disponível (limit/auth), tentar outro modelo vision do Groq em vez de silenciosamente pular a descrição |
 | 11 | **Backend do descritor no resultado** | `result.json` / `meta.json` | Gravar qual backend de descrição foi usado (`florence` ou `groq`) no `meta.json`, para rastreabilidade ao remontar a timeline |
 | 12 | **Validação de `config.json`** | `config.py` | Se `config.json` tiver chaves desconhecidas ou valores fora de range (ex.: `max_frames_per_minute: -5`), logar aviso em vez de silenciosamente usar valor inválido |
+| 21 | **Modo online / ao vivo (stream)** _(2026-06-26)_ | `frame_selector.py` | Tornar a seleção de frames e o dedup **incrementais** para uma fonte ao vivo (calibração rolling + warmup, janela de dedup limitada, emit atrasado ~`MIN_GAP`, nova fonte `from_events`). Base para o `ponte_android`. Spec completa: [`planning/modo_online.md`](modo_online.md) |
 
 ---
 
