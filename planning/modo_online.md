@@ -34,6 +34,27 @@ emitindo à medida que a sessão acontece.
 | 4 | **Nova fonte `from_events`** | `frame_selector.py` | Marca de frame a partir de uma **lista de ações** (taps/swipes/logcat/console) com timestamp — mesmo formato de `from_chapters`. Substitui a fala como trilha textual da timeline. No celular a intenção é **observável** (você emitiu o tap), não inferida. |
 | 5 | **Re-tunar constantes p/ UI estática** | `frame_selector.py` | `SCENE_SCORE_FLOOR=0.06`, fatores de ruído etc. foram calibrados p/ **vídeo** (movimento contínuo). UI é o regime oposto (estática + saltos discretos): no estático o termo adaptativo some e quem decide é o **FLOOR**. **Medir a distribuição numa gravação de UI real antes de cravar** (relaciona com o item 9 do backlog). |
 
+## Decisões (2026-07-03)
+
+- **Alvo:** stream ao vivo direto (não pós-sessão primeiro).
+- **Fonte:** scrcpy raw (frames contínuos) → a mudança #1 (detector de mudança
+  incremental próprio) **entra em escopo de fato**; não vem detecção pronta do minicap.
+- **#5 dissolvida na #1.** As constantes não são cravadas de um corpus: a calibração
+  rolling (mudança #1) **se auto-recalibra ao padrão da própria tela ao vivo** — área por
+  `EMA(média) + K·EMA(desvio)` e piso de ruído (`T_cor`) derivado do próprio stream
+  (percentil das distâncias de fundo), como o batch já faz do vídeo. O corpus de UI vira
+  ferramenta de **validação/tuning posterior** (warmup / K / piso), não pré-requisito.
+- **Ressalvas honestas do auto-recalibrar:** *cold start* (janela de warmup + default
+  conservador até ver ≥1 mudança real) e o *piso absoluto* no regime morto-estático
+  (âncora vinda do `T_cor` auto-medido, não relativa).
+- **Arquitetura:** engine incremental **source-agnostic** (consome iterador de
+  `(t_pc, frame)`), validável por *replay* de clipe/sintético sem telefone; o adaptador
+  scrcpy é camada fina por cima. Reusa os primitivos puros do `frame_selector`
+  (`_dirty_fraction`, predicado de dedup) — não duplica.
+- **`from_events` tem dois papéis:** marca de frame (mora no seletor, trivial como
+  `from_chapters`) e **trilha textual** da timeline (no montador `server.py`/`processor.py`
+  — o `FrameMark` não carrega texto). Só o primeiro papel é do seletor.
+
 ## Forma de uso (esboço)
 
 - **Timeline pós-sessão:** grava a sessão (`screenrecord` / `scrcpy --record`) →

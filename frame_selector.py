@@ -490,6 +490,26 @@ def _dirty_fraction(a, b, t_cor: float = DEDUP_T_COR) -> float:
     return float((((a - b) ** 2).sum(axis=2) > t_cor * t_cor).mean())
 
 
+def _is_dup_of(ph, ch, small, sigs,
+               distance: int = PHASH_DISTANCE,
+               color_distance: int = COLOR_DISTANCE,
+               t_cor: float = DEDUP_T_COR) -> bool:
+    """True se (ph, ch, small) e duplicata de alguma assinatura em `sigs`.
+
+    Mesma regra do dedup_visual, isolada para reuso pelo seletor online (janela
+    de dedup limitada). `sigs` e uma sequencia de (phash, colorhash, small_rgb).
+    Duplicata quando: a fracao de pixels diferentes e minima (< DIRTY_DUP_LOW), ou
+    pHash E colorhash concordam E os pixels nao diferem muito (< DIRTY_DUP_VETO).
+    """
+    for p, c, arr in sigs:
+        df = _dirty_fraction(small, arr, t_cor)
+        if df < DIRTY_DUP_LOW:
+            return True
+        if (ph - p) <= distance and (ch - c) <= color_distance and df < DIRTY_DUP_VETO:
+            return True
+    return False
+
+
 def dedup_visual(frames: list[tuple[FrameMark, str]],
                  distance: int = PHASH_DISTANCE,
                  color_distance: int = COLOR_DISTANCE,
@@ -519,16 +539,7 @@ def dedup_visual(frames: list[tuple[FrameMark, str]],
         except Exception as exc:  # frame corrompido -> ignora silenciosamente
             log.warning("Falha ao hashear %s: %s", path, exc)
             continue
-        is_dup = False
-        for p, c, arr in sigs:
-            df = _dirty_fraction(small, arr, t_cor)
-            if df < DIRTY_DUP_LOW:
-                is_dup = True  # quase identicos pixel a pixel
-                break
-            if (ph - p) <= distance and (ch - c) <= color_distance and df < DIRTY_DUP_VETO:
-                is_dup = True  # pHash concorda E os pixels nao diferem muito
-                break
-        if is_dup:
+        if _is_dup_of(ph, ch, small, sigs, distance, color_distance, t_cor):
             continue
         sigs.append((ph, ch, small))
         kept.append((mark, path))
