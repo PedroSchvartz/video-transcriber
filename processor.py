@@ -1025,62 +1025,68 @@ def process(source: str, max_screenshots: int = 20, cache_id: str | None = None,
         if not video_secs:
             video_secs = float(duration or 0)
 
-        # Cinco fontes de marcas; merge por prioridade capitulo>cena>edicao>fala>audio.
-        # As tres passadas de ffmpeg (cena e edicao no video, onsets no audio) sao
-        # independentes e subprocess-bound: rodam em paralelo (as threads liberam
-        # o GIL enquanto o ffmpeg trabalha), cortando o tempo desta etapa.
-        _p("deteccao", "detectando cenas, edicao e audio")
-        # Sinal de progresso honesto da deteccao: o detector de edicao (a passada
-        # mais lenta das tres) reporta quantos segundos do video ja varreu. Como
-        # roda em thread enquanto o principal espera em .result(), so essa thread
-        # escreve o status aqui — sem corrida.
-        det_total = float(duration or video_secs or 0)
+        # max_screenshots=0: so a transcricao. Pula toda a parte visual (deteccao
+        # de cenas/edicao/audio + extracao + dedup), que e a fatia pesada do
+        # pipeline e nao serve a quem quer apenas o texto.
+        if max_screenshots <= 0:
+            frame_list = []
+        else:
+            # Cinco fontes de marcas; merge por prioridade capitulo>cena>edicao>fala>audio.
+            # As tres passadas de ffmpeg (cena e edicao no video, onsets no audio) sao
+            # independentes e subprocess-bound: rodam em paralelo (as threads liberam
+            # o GIL enquanto o ffmpeg trabalha), cortando o tempo desta etapa.
+            _p("deteccao", "detectando cenas, edicao e audio")
+            # Sinal de progresso honesto da deteccao: o detector de edicao (a passada
+            # mais lenta das tres) reporta quantos segundos do video ja varreu. Como
+            # roda em thread enquanto o principal espera em .result(), so essa thread
+            # escreve o status aqui — sem corrida.
+            det_total = float(duration or video_secs or 0)
 
-        def _det_progress(done_secs):
-            if det_total:
-                _p("deteccao", "detectando cenas, edicao e audio",
-                   frac=max(0.0, min(1.0, done_secs / det_total)))
+            def _det_progress(done_secs):
+                if det_total:
+                    _p("deteccao", "detectando cenas, edicao e audio",
+                       frac=max(0.0, min(1.0, done_secs / det_total)))
 
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            f_scenes = ex.submit(fs.detect_scenes, video_path)
-            f_edits = ex.submit(fs.detect_edits, video_path, progress=_det_progress)
-            f_audio = ex.submit(fs.detect_audio_events, audio_path)
-            scenes, edits, audio_events = f_scenes.result(), f_edits.result(), f_audio.result()
-        smart = fs.merge(
-            fs.from_words(transcript["words"]),
-            scenes,
-            edits,
-            audio_events,
-            fs.from_chapters(metadata.get("chapters")),
-        )
-        # Budget de prints proporcional a duracao: 1 a 12 por minuto de video.
-        budget = fs.screenshot_budget(max_screenshots, duration)
-        marks = fs.fill_to_budget(smart, duration, budget)
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                f_scenes = ex.submit(fs.detect_scenes, video_path)
+                f_edits = ex.submit(fs.detect_edits, video_path, progress=_det_progress)
+                f_audio = ex.submit(fs.detect_audio_events, audio_path)
+                scenes, edits, audio_events = f_scenes.result(), f_edits.result(), f_audio.result()
+            smart = fs.merge(
+                fs.from_words(transcript["words"]),
+                scenes,
+                edits,
+                audio_events,
+                fs.from_chapters(metadata.get("chapters")),
+            )
+            # Budget de prints proporcional a duracao: 1 a 12 por minuto de video.
+            budget = fs.screenshot_budget(max_screenshots, duration)
+            marks = fs.fill_to_budget(smart, duration, budget)
 
-        extracted: list[tuple[fs.FrameMark, str]] = []
-        n_marks = len(marks)
-        step = max(1, n_marks // 40)  # nao escreve status a cada frame em videos longos
-        # Etapa propria: aqui a fracao i/n e um sinal honesto (1 frame por marca),
-        # ao contrario da deteccao. O ETA da extracao extrapola desse progresso real.
-        _p("extracao", f"capturando prints (0/{n_marks})", frac=0.0)
-        for i, mark in enumerate(marks):
-            # Marcas de cena: escolhe o frame mais nitido na janela do shot (evita
-            # meio-fade/borrao); as demais sao capturadas no proprio instante.
-            if mark.window:
-                mark.time = pick_sharpest_time(video_path, mark.window[0], mark.window[1])
-            name = f"{i:03d}_{fmt_time(mark.time).replace(':', '-')}_{mark.reason}.jpg"
-            out = os.path.join(frames_dir, name)
-            if extract_frame(video_path, mark.time, out):
-                extracted.append((mark, out))
-            if i % step == 0 or i == n_marks - 1:
-                _p("extracao", f"capturando prints ({i + 1}/{n_marks})",
-                   frac=(i + 1) / max(1, n_marks))
-        extracted = fs.drop_blank(extracted)
-        frames = fs.dedup_visual(extracted)
-        if video_secs and "extracao" in stage_start:
-            _record_timing("extracao", time.time() - stage_start["extracao"], video_secs)
+            extracted: list[tuple[fs.FrameMark, str]] = []
+            n_marks = len(marks)
+            step = max(1, n_marks // 40)  # nao escreve status a cada frame em videos longos
+            # Etapa propria: aqui a fracao i/n e um sinal honesto (1 frame por marca),
+            # ao contrario da deteccao. O ETA da extracao extrapola desse progresso real.
+            _p("extracao", f"capturando prints (0/{n_marks})", frac=0.0)
+            for i, mark in enumerate(marks):
+                # Marcas de cena: escolhe o frame mais nitido na janela do shot (evita
+                # meio-fade/borrao); as demais sao capturadas no proprio instante.
+                if mark.window:
+                    mark.time = pick_sharpest_time(video_path, mark.window[0], mark.window[1])
+                name = f"{i:03d}_{fmt_time(mark.time).replace(':', '-')}_{mark.reason}.jpg"
+                out = os.path.join(frames_dir, name)
+                if extract_frame(video_path, mark.time, out):
+                    extracted.append((mark, out))
+                if i % step == 0 or i == n_marks - 1:
+                    _p("extracao", f"capturando prints ({i + 1}/{n_marks})",
+                       frac=(i + 1) / max(1, n_marks))
+            extracted = fs.drop_blank(extracted)
+            frames = fs.dedup_visual(extracted)
+            if video_secs and "extracao" in stage_start:
+                _record_timing("extracao", time.time() - stage_start["extracao"], video_secs)
 
-        frame_list = [{"time": m.time, "reason": m.reason, "path": p} for m, p in frames]
+            frame_list = [{"time": m.time, "reason": m.reason, "path": p} for m, p in frames]
 
         # Anotacao OPCIONAL dos prints (OCR + descricao), so nos frames que sobraram.
         # Etapa fora do modelo de ETA (e condicional): reporta andamento direto, com
