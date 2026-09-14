@@ -18,9 +18,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs, urlsplit
 
 import ffmpeg_tools
 import config
@@ -35,7 +37,11 @@ ffmpeg_tools.ensure_on_path()
 # --- Parametros ------------------------------------------------------------
 __version__ = "1.10.0"               # versao do pipeline; carimbada no meta.json
 GROQ_MODEL = "whisper-large-v3-turbo"
-LOCAL_MODEL = "base"                 # modelo faster-whisper de fallback
+LOCAL_MODEL = "large-v3-turbo"       # faster-whisper de fallback: turbo = quase a
+                                     # qualidade do large-v3 (multilingue/PT-BR forte)
+                                     # a ~4x a velocidade. Pesos ~1.6GB (baixados na 1a
+                                     # vez); em CPU pode nao acompanhar o ao vivo — se
+                                     # travar, caia p/ "small". Groq segue preferido.
 GROQ_SIZE_LIMIT = 24 * 1024 * 1024   # 24 MB — abaixo do limite free de 25 MB
 CHUNK_SECONDS = 600                  # 10 min por pedaco quando o audio e longo
 FRAME_MAX_WIDTH = 1080               # largura maxima do print (reduz base64)
@@ -107,6 +113,184 @@ def _is_url(source: str) -> bool:
     return source.startswith(("http://", "https://", "www."))
 
 
+def _is_instagram(source: str) -> bool:
+    return "instagram.com" in (source or "").lower()
+
+
+# ===========================================================================
+# Registro de "ja visto" — bloqueia reprocessar a mesma fonte por acidente
+# ===========================================================================
+# Um mesmo video chega com URLs diferentes: a colada tem query (?igsh=...,
+# ?utm_source=...), a canonica (webpage_url do yt-dlp) nao. So o cache_id
+# (hash da string crua) nao basta para reconhecer que ja vimos. _normalize_source
+# reduz a fonte a uma IDENTIDADE estavel: shortcode no Instagram, video-id no
+# YouTube, caminho absoluto para arquivo local, host+path para o resto. O registro
+# fica em _cache/_seen.json (irmao de _timings.json; sobrevive a limpeza LRU, que
+# so apaga as pastas Video_*).
+SEEN_PATH = os.path.join(CACHE_DIR, "_seen.json")
+_IG_SHORTCODE = re.compile(r"/(?:reel|reels|p|tv)/([^/?#]+)", re.I)
+_YT_SHORTS = re.compile(r"/shorts/([^/?#]+)", re.I)
+
+
+class AlreadySeenError(Exception):
+    """Fonte ja processada antes. Reprocessar de proposito: force=True."""
+
+
+class ImagePostError(Exception):
+    """Fonte e um post/carrossel de imagem (sem faixa de video). Nao da para
+    transcrever: o pipeline roteia para o ramo de imagem (baixa as fotos +
+    legenda com o gallery-dl e monta a timeline sem audio)."""
+
+
+def _normalize_source(source: str) -> str:
+    s = (source or "").strip().strip('"').strip("'")
+    if not _is_url(s):                       # arquivo local -> caminho absoluto
+        p = os.path.expanduser(s)
+        try:
+            return "file:" + os.path.normcase(os.path.abspath(p))
+        except Exception:
+            return "file:" + os.path.normcase(p)
+    u = urlsplit(s if "//" in s else "https://" + s)
+    host = (u.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if "instagram.com" in host:              # identidade = shortcode
+        m = _IG_SHORTCODE.search(u.path)
+        if m:
+            return "instagram:" + m.group(1)
+    if "youtube.com" in host or "youtu.be" in host:   # identidade = video id
+        if "youtu.be" in host:
+            vid = u.path.strip("/").split("/")[0]
+        else:
+            m = _YT_SHORTS.search(u.path)
+            vid = m.group(1) if m else (parse_qs(u.query).get("v") or [""])[0]
+        if vid:
+            return "youtube:" + vid
+    # Fallback conservador: nao descarta query (outros sites usam-na como id),
+    # so tira fragmento e barra final e normaliza o host.
+    path = u.path.rstrip("/")
+    return host + path + (("?" + u.query) if u.query else "")
+
+
+def _load_seen() -> dict:
+    try:
+        with open(SEEN_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def is_seen(source: str) -> dict | None:
+    """Registro ({source, title, at}) se a fonte ja foi processada, senao None."""
+    return _load_seen().get(_normalize_source(source))
+
+
+def mark_seen(source: str, title: str | None = None) -> None:
+    """Registra a fonte como vista. Idempotente (nao sobrescreve o 1o registro)."""
+    key = _normalize_source(source)
+    seen = _load_seen()
+    if key in seen:
+        return
+    seen[key] = {"source": source, "title": title, "at": time.time()}
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(SEEN_PATH, "w", encoding="utf-8") as f:
+            json.dump(seen, f, ensure_ascii=False, indent=2)
+    except Exception:
+        log.warning("Falha ao gravar %s", SEEN_PATH)
+
+
+# Cookies para plataformas que exigem login (Instagram sobretudo — hoje ate reel
+# "publico" costuma vir vazio sem sessao). Ordem de preferencia:
+#   1. arquivo cookies.txt (Netscape) — ROBUSTO: nao depende do Chrome aberto nem
+#      da criptografia app-bound do Chrome novo, que travam o `cookiesfrombrowser`.
+#      Caminho via VT_COOKIES_FILE (.env) ou um cookies.txt/*_cookies.txt na pasta.
+#   2. cookies do navegador (Chrome), so como ultimo recurso quando falta o arquivo.
+def cookie_file() -> str | None:
+    """Caminho do cookies.txt, se configurado/encontrado. Senao None."""
+    env = os.environ.get("VT_COOKIES_FILE")
+    if env:
+        p = os.path.expanduser(env.strip('"').strip("'"))
+        if os.path.isfile(p):
+            return p
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("cookies.txt", "instagram_cookies.txt",
+                 "www.instagram.com_cookies.txt"):
+        cand = os.path.join(here, name)
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _cookie_opts() -> dict:
+    """Opcoes de cookie para o yt-dlp: arquivo se houver, senao vazio."""
+    f = cookie_file()
+    return {"cookiefile": f} if f else {}
+
+
+# O YouTube exige resolver o "n-challenge" (JavaScript) para liberar as URLs de
+# midia; sem um runtime JS o yt-dlp cai em clients degradados e a URL do formato
+# devolve HTTP 403. O padrao do yt-dlp so habilita `deno`; aqui detectamos o
+# primeiro runtime disponivel (deno preferido, senao node/bun) e o habilitamos.
+# Se nada for encontrado, devolve {} (mantem o comportamento padrao).
+import shutil as _shutil
+
+
+def _js_runtime_opts() -> dict:
+    # Ordem de prioridade do proprio yt-dlp: deno > node > bun. Procuramos no PATH
+    # e, se nao achar, em locais conhecidos no Windows — o worker roda DESTACADO e
+    # pode herdar um PATH sem o node, entao passamos o caminho absoluto explicito.
+    candidates = (
+        ("deno", "deno", [
+            os.path.expandvars(r"%USERPROFILE%\.deno\bin\deno.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\deno\deno.exe"),
+            r"C:\Program Files\deno\deno.exe",
+        ]),
+        ("node", "node", [
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Program Files (x86)\nodejs\node.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\nodejs\node.exe"),
+        ]),
+        ("bun", "bun", [
+            os.path.expandvars(r"%USERPROFILE%\.bun\bin\bun.exe"),
+        ]),
+    )
+    for name, exe, fallbacks in candidates:
+        path = _shutil.which(exe)
+        if path:
+            return {"js_runtimes": {name: {}}}
+        for fb in fallbacks:
+            if fb and os.path.isfile(fb):
+                return {"js_runtimes": {name: {"path": fb}}}
+    return {}
+
+
+def _is_youtube(source: str) -> bool:
+    s = (source or "").lower()
+    return "youtube.com" in s or "youtu.be" in s
+
+
+# Opcoes do yt-dlp que dependem da FONTE. Para o YouTube, dois pontos criticos
+# (validados em 2026-08): (1) os formatos DASH web/tv passaram a exigir um "GVS
+# PO Token" e devolvem HTTP 403 no meio do download; o client `android` entrega o
+# formato 18 (muxado 360p) que baixa sem PO token — resolucao mais que suficiente
+# p/ transcricao + prints. (2) enviar cookies de CONTA do YouTube ativa a
+# exigencia de PO token e derruba justamente o client que funcionava, entao NAO
+# mandamos cookies para o YouTube (cookies seguem valendo p/ Instagram etc.).
+def _source_ydl_opts(source: str) -> dict:
+    opts = dict(_js_runtime_opts())
+    if _is_youtube(source):
+        opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+        # Formatos DASH (video/audio separados) do YouTube exigem PO token e dao
+        # 403 no meio do download. O formato MUXADO (itag 18, 360p) baixa direto
+        # pelo client android — resolucao suficiente p/ transcricao + prints.
+        # Preferimos o melhor muxado; DASH so como ultimo recurso.
+        opts["format"] = "b[protocol=https][acodec!=none][vcodec!=none]/18/b"
+    else:
+        opts.update(_cookie_opts())
+    return opts
+
+
 # === Erros de servicos NAO-locais (rede/nuvem) =============================
 # Servicos locais (ffmpeg, faster-whisper ja baixado) nao entram aqui. Os de
 # rede podem falhar por: CONEXAO (sem internet/DNS/timeout — sem status HTTP),
@@ -157,6 +341,87 @@ def _describe_download_error(exc: Exception) -> tuple[str, str]:
     return "outro", text
 
 
+# Instrucao de cookies.txt — o caminho robusto p/ Instagram (nao depende do Chrome
+# aberto nem da criptografia app-bound). Anexada aos erros que costumam ser "precisa
+# de sessao" quando ainda nao ha um cookies.txt configurado.
+_COOKIES_HOWTO = (
+    "O Instagram hoje exige sessao ate para muito conteudo publico. Para resolver de "
+    "vez, gere um arquivo cookies.txt: instale a extensao \"Get cookies.txt LOCALLY\" "
+    "no Chrome, abra o instagram.com logado, exporte o cookies.txt e salve como "
+    "'cookies.txt' na pasta tools/video_transcriber (ou aponte VT_COOKIES_FILE no .env "
+    "para ele). Depois disso o download passa a funcionar sem depender do Chrome aberto."
+)
+
+COOKIE_WARN_DAYS = 14  # avisa quando faltar menos que isso p/ o sessionid expirar
+
+
+def cookie_status() -> dict | None:
+    """Validade da sessao do Instagram no cookies.txt — SEM rede, so le o arquivo.
+
+    Le o expiry do 'sessionid' (o cookie que autentica). Retorna None se nao ha
+    arquivo; senao {path, sessionid_expiry, days_left, expired}.
+    """
+    f = cookie_file()
+    if not f:
+        return None
+    exp = None
+    try:
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("#") or "\t" not in line:
+                    continue
+                p = line.rstrip("\n").split("\t")
+                if (len(p) >= 7 and p[5] == "sessionid"
+                        and "instagram" in p[0].lower() and p[4].isdigit()):
+                    exp = int(p[4])
+                    break
+    except OSError:
+        pass
+    now = time.time()
+    return {
+        "path": f,
+        "sessionid_expiry": exp,
+        "days_left": ((exp - now) / 86400) if exp else None,
+        "expired": (exp is not None and exp <= now),
+    }
+
+
+def cookie_warning(source: str) -> str | None:
+    """Aviso PROATIVO p/ fontes do Instagram: cookies ausentes, expirados ou perto
+    de expirar. None quando esta tudo certo (ou a fonte nao e Instagram)."""
+    if not _is_instagram(source):
+        return None
+    st = cookie_status()
+    if st is None:
+        return "Sem cookies.txt para o Instagram — o download vai falhar.\n" + _COOKIES_HOWTO
+    if st["expired"]:
+        return "Cookies do Instagram EXPIRARAM — re-exporte o cookies.txt.\n" + _COOKIES_HOWTO
+    days = st["days_left"]
+    if days is not None and days <= COOKIE_WARN_DAYS:
+        import datetime as _dt
+        d = _dt.datetime.fromtimestamp(st["sessionid_expiry"])
+        return (f"Cookies do Instagram vencem em ~{days:.0f} dias ({d:%Y-%m-%d}) — "
+                f"considere re-exportar o cookies.txt em breve.")
+    return None
+
+
+def _instagram_cookie_hint(source: str) -> str:
+    """Sufixo p/ a mensagem de FALHA de download do Instagram, ciente da validade."""
+    if not _is_instagram(source):
+        return ""
+    st = cookie_status()
+    if st is None:
+        return "\n\n" + _COOKIES_HOWTO
+    if st["expired"]:
+        return "\n\nSeus cookies do Instagram EXPIRARAM. " + _COOKIES_HOWTO
+    # Presentes e dentro da validade, mas a autenticacao falhou: sessao pode ter
+    # sido invalidada (logout/seguranca) ou o post e mesmo privado/removido.
+    return ("\n\nOs cookies do Instagram estao presentes e na validade, mas a "
+            "autenticacao falhou — a sessao pode ter sido invalidada (logout ou "
+            "verificacao de seguranca), ou o post e realmente privado/removido. "
+            "Tente re-exportar o cookies.txt.")
+
+
 def _download_error_text(cat: str, msg: str, source: str) -> str:
     if cat == "conexao":
         return (f"Sem conexao com a internet/plataforma ao baixar ({source}). "
@@ -165,14 +430,16 @@ def _download_error_text(cat: str, msg: str, source: str) -> str:
         return (f"A plataforma limitou as requisicoes (HTTP 429) ao baixar ({source}). "
                 f"Aguarde alguns minutos e tente de novo. Detalhe: {msg}")
     if cat == "conteudo":
-        return (f"Video indisponivel (privado/removido/restrito por regiao ou login): "
-                f"{source}. Se for privado, faca login no site pelo Chrome. Detalhe: {msg}")
+        base = (f"Video indisponivel (privado/removido/restrito por regiao ou login): "
+                f"{source}. Detalhe: {msg}")
+        return base + _instagram_cookie_hint(source)
     if cat == "cookies":
         return (f"Nao consegui ler os cookies do Chrome para acessar conteudo logado "
-                f"({source}). Feche o Chrome e tente de novo, e confirme que voce esta "
-                f"logado no site no Chrome. Detalhe: {msg}")
-    return (f"Nao foi possivel baixar ({source}) — verifique se o link e mesmo de um "
+                f"({source}). Feche o Chrome e tente de novo. Alternativa mais "
+                f"robusta:\n\n{_COOKIES_HOWTO}")
+    base = (f"Nao foi possivel baixar ({source}) — verifique se o link e mesmo de um "
             f"video (YouTube/Instagram/etc). Detalhe: {msg}")
+    return base + _instagram_cookie_hint(source)
 
 
 def download_or_locate(source: str, workdir: str, progress=None) -> tuple[str, dict]:
@@ -213,6 +480,8 @@ def download_or_locate(source: str, workdir: str, progress=None) -> tuple[str, d
         "noplaylist": True,
         "restrictfilenames": True,
         "socket_timeout": 60,
+        # cookies (nao-YouTube) + runtime JS + client android p/ YouTube (evita 403)
+        **_source_ydl_opts(source),
     }
 
     def _run(extra: dict | None = None) -> dict:
@@ -223,13 +492,19 @@ def download_or_locate(source: str, workdir: str, progress=None) -> tuple[str, d
     try:
         info = _run()
     except Exception as exc:
+        # Post/carrossel de imagem: sem faixa de video (o yt-dlp nao baixa). Sinaliza
+        # para o pipeline rotear ao ramo de imagem (gallery-dl) em vez de "falhar".
+        if _is_instagram(source) and _is_image_post_error(exc):
+            raise ImagePostError(source) from exc
         cat, msg = _describe_download_error(exc)
-        # Cookies do Chrome SO ajudam conteudo logado (privado/login). Em conexao,
-        # limite, URL nao-suportada etc., reintentar e inutil e ainda surfaria o erro
-        # de DPAPI dos cookies: entao falha logo com a mensagem clara do 1o erro.
-        if cat != "conteudo":
+        # Se ja usamos um cookies.txt, o navegador nao acrescenta nada: falha logo
+        # com a mensagem clara. Idem para conexao/limite (reintentar e inutil e
+        # surfaria o erro de DPAPI dos cookies). So vale tentar o navegador quando
+        # falta cookie file E o erro cheira a "precisa de login" (conteudo/outro —
+        # o "empty media response" do Instagram cai em 'outro').
+        if cookie_file() or cat not in ("conteudo", "outro"):
             raise RuntimeError(_download_error_text(cat, msg, source)) from exc
-        log.warning("Conteudo exige login (%s); tentando cookies do Chrome", msg)
+        log.warning("Conteudo pode exigir login (%s); tentando cookies do Chrome", msg)
         try:
             info = _run({"cookiesfrombrowser": ("chrome",)})
         except Exception as exc2:
@@ -266,16 +541,197 @@ def probe_source(source: str) -> dict:
 
     import yt_dlp
 
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": _QUIET_YDL,
-                           "noplaylist": True, "skip_download": True,
-                           "socket_timeout": 30}) as ydl:
-        info = ydl.extract_info(source, download=False)
+    base = {"quiet": True, "no_warnings": True, "logger": _QUIET_YDL,
+            "noplaylist": True, "skip_download": True, "socket_timeout": 30,
+            **_source_ydl_opts(source)}
+
+    def _probe(extra: dict | None = None) -> dict:
+        with yt_dlp.YoutubeDL({**base, **(extra or {})}) as ydl:
+            return ydl.extract_info(source, download=False)
+
+    try:
+        info = _probe()
+    except Exception as exc:
+        # Post/carrossel de imagem: sem faixa de video. Nao e erro — roteia para o
+        # ramo de imagem com metadados leves (o download real vem do gallery-dl).
+        if _is_instagram(source) and _is_image_post_error(exc):
+            return _probe_image_post(source)
+        # Instagram (e afins) exigem sessao ate no probe. Sem cookies.txt, tenta o
+        # navegador como ultimo recurso; se ainda falhar, erro claro e acionavel.
+        cat, msg = _describe_download_error(exc)
+        if cookie_file() or cat not in ("conteudo", "outro"):
+            raise RuntimeError(_download_error_text(cat, msg, source)) from exc
+        try:
+            info = _probe({"cookiesfrombrowser": ("chrome",)})
+        except Exception as exc2:
+            cat2, msg2 = _describe_download_error(exc2)
+            raise RuntimeError(_download_error_text(cat2, msg2, source)) from exc2
     return {
         "title": info.get("title"),
         "duration": info.get("duration"),
         "source": info.get("webpage_url") or source,
         "chapters": info.get("chapters"),
     }
+
+
+# ===========================================================================
+# Posts de imagem do Instagram (carrossel/foto) — sem faixa de video
+# ===========================================================================
+# O yt-dlp (downloader de VIDEO da ferramenta) recusa post so-imagem com
+# "No video formats found". Nao e falha de sessao nem de rede: e conteudo sem
+# video. Detectamos esse sinal e roteamos para o gallery-dl, que baixa as fotos
+# do carrossel; a "timeline" vira legenda + imagens (que o Claude le como prints).
+def _is_image_post_error(exc: Exception | str) -> bool:
+    """True se o erro do yt-dlp indica post so-imagem (sem faixa de video)."""
+    text = str(getattr(exc, "msg", "") or exc).lower()
+    return "no video formats found" in text
+
+
+def _post_title(m: dict) -> str:
+    """Titulo legivel para um post de imagem: 1a linha da legenda, senao o autor."""
+    cap = (m.get("description") or "").strip()
+    if cap:
+        first = cap.splitlines()[0].strip()
+        return (first[:70] + "…") if len(first) > 70 else first
+    return f"Post de {m.get('username') or 'instagram'}"
+
+
+def _probe_image_post(source: str) -> dict:
+    """Metadados leves de um post de imagem, SEM baixar (yt-dlp, process=False).
+
+    process=False nao entra em cada filho do carrossel (que e o que dispara o
+    "No video formats found"), entao devolve titulo + legenda de graca.
+    """
+    import yt_dlp
+    opts = {"quiet": True, "no_warnings": True, "logger": _QUIET_YDL,
+            "skip_download": True, "socket_timeout": 30, **_source_ydl_opts(source)}
+    title = "Post do Instagram"
+    src = source
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(source, download=False, process=False)
+        cap = (info.get("description") or "").strip()
+        title = _post_title({"description": cap, "username": info.get("uploader_id")})
+        src = info.get("webpage_url") or source
+    except Exception:
+        pass  # titulo generico basta; o worker preenche o meta real via gallery-dl
+    return {"title": title, "duration": 0, "source": src, "chapters": None, "kind": "image"}
+
+
+def _image_download_error_text(source: str, stderr: str) -> str:
+    """Mensagem de falha do download de imagens (gallery-dl), ciente dos cookies."""
+    base = "Nao consegui baixar as imagens deste post do Instagram."
+    detail = ""
+    for line in reversed((stderr or "").strip().splitlines()):
+        if line.strip():
+            detail = line.strip()
+            break
+    if detail:
+        base += f"\nDetalhe: {detail}"
+    return base + _instagram_cookie_hint(source)
+
+
+def download_images(source: str, workdir: str) -> dict:
+    """Baixa as imagens de um post/carrossel do Instagram (gallery-dl) + a legenda.
+
+    Usa o MESMO cookies.txt do resto do pipeline. `--write-metadata` grava um
+    JSON irmao por imagem (com `num` para ordenar e `description` = legenda).
+    Retorna {title, caption, images:[paths ordenados], source, username, date}.
+    """
+    cmd = [sys.executable, "-m", "gallery_dl", "-q", "-D", workdir, "--write-metadata"]
+    cf = cookie_file()
+    if cf:
+        cmd += ["--cookies", cf]
+    cmd.append(source)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=300, creationflags=CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("O download das imagens excedeu 300s e foi abortado.") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("gallery-dl nao encontrado. Instale com: pip install gallery-dl") from exc
+
+    items: list[tuple[int, str, dict]] = []
+    for mp in glob.glob(os.path.join(workdir, "*.json")):
+        try:
+            with open(mp, encoding="utf-8") as f:
+                m = json.load(f)
+        except Exception:
+            continue
+        img = mp[:-5]  # tira ".json"
+        if os.path.isfile(img):
+            items.append((int(m.get("num") or 0), img, m))
+    if not items:
+        raise RuntimeError(_image_download_error_text(source, r.stderr))
+    items.sort(key=lambda t: t[0])
+    first = items[0][2]
+    return {
+        "title": _post_title(first),
+        "caption": first.get("description") or "",
+        "images": [img for _, img, _ in items],
+        "source": first.get("post_url") or source,
+        "username": first.get("username"),
+        "date": str(first.get("date") or ""),
+    }
+
+
+def _process_image_post(source: str, cache_id: str | None, report) -> dict:
+    """Ramo de imagem: baixa as fotos do post + legenda e monta a timeline SEM
+    audio (legenda como texto em t=0, imagens como prints em ordem). Espelha a
+    persistencia do `process()` (artifact/result/meta + mark_seen)."""
+    work = tempfile.mkdtemp(prefix="vidtx_img_")
+    try:
+        report("download", "baixando imagens do post")
+        info = download_images(source, work)
+        title = info["title"]
+        if not cache_id:
+            cache_id = make_cache_id(title, source)
+        cache_dir = os.path.join(CACHE_DIR, cache_id)
+        frames_dir = os.path.join(cache_dir, "frames")
+        if os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        os.makedirs(frames_dir, exist_ok=True)
+
+        n = len(info["images"])
+        frames: list[dict] = []
+        for i, src_img in enumerate(info["images"]):
+            dst = os.path.join(frames_dir, f"{i:03d}_slide.jpg")
+            shutil.move(src_img, dst)
+            frames.append({"time": float(i), "reason": f"slide {i + 1}/{n}", "path": dst})
+
+        caption = (info.get("caption") or "").strip()
+        segments = [{"start": 0.0, "text": caption}] if caption else []
+        metadata = {"title": title, "source": info.get("source") or source,
+                    "duration": 0, "engine": "post de imagem (gallery-dl)",
+                    "chapters": None}
+        transcript_text = caption or "_(post de imagem, sem legenda)_"
+
+        _save_artifact(cache_dir, format_transcript(
+            {"segments": segments, "engine": metadata["engine"]}, metadata), frames)
+        _save_result(cache_dir, segments, frames)
+        _save_meta(cache_dir, {
+            "cache_id": cache_id,
+            "version": __version__,
+            "title": title,
+            "source": metadata["source"],
+            "duration": 0,
+            "engine": metadata["engine"],
+            "video_path": None,
+            "chapters": None,
+        })
+        _prune_cache()
+        mark_seen(metadata["source"], title)
+        report("done", "")
+        return {
+            "cache_id": cache_id,
+            "cache_dir": cache_dir,
+            "metadata": metadata,
+            "segments": segments,
+            "transcript_text": transcript_text,
+            "frames": frames,
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ===========================================================================
@@ -491,14 +947,14 @@ def transcribe_local(audio_path: str) -> dict:
     try:
         model = WhisperModel(LOCAL_MODEL, device="cpu", compute_type="int8")
     except Exception as exc:
-        # O modelo e local apos a 1a vez, mas a 1a carga BAIXA os pesos (~140MB) do
-        # Hugging Face. Sem conexao e sem cache, esse e o unico ponto que precisa de
-        # rede no modo local — e nao ha outro fallback. Mensagem clara em vez de stack.
+        # O modelo e local apos a 1a vez, mas a 1a carga BAIXA os pesos do Hugging
+        # Face (large-v3-turbo ~1.6GB). Sem conexao e sem cache, esse e o unico ponto
+        # que precisa de rede no modo local — e nao ha outro fallback. Mensagem clara.
         if _looks_like_connection_error(str(exc)):
             raise RuntimeError(
-                f"Sem conexao para baixar o modelo local '{LOCAL_MODEL}' (~140MB, "
-                "Hugging Face) na primeira execucao. Conecte a internet uma vez para "
-                "baixar o modelo, ou configure GROQ_API_KEY. Detalhe: " + str(exc)
+                f"Sem conexao para baixar o modelo local '{LOCAL_MODEL}' (Hugging "
+                "Face) na primeira execucao. Conecte a internet uma vez para baixar "
+                "o modelo, ou configure GROQ_API_KEY. Detalhe: " + str(exc)
             ) from exc
         raise
     seg_iter, _info = model.transcribe(audio_path, word_timestamps=True, vad_filter=True)
@@ -723,7 +1179,8 @@ def mark_cancelled(cache_id: str) -> None:
 
 
 def run_job(cache_id: str, source: str, max_screenshots: int = 20,
-            do_ocr: bool = False, caption_backend: str | None = None) -> None:
+            do_ocr: bool = False, caption_backend: str | None = None,
+            force: bool = False) -> None:
     """Roda o pipeline atualizando o status. Entrypoint do worker em subprocesso.
 
     Atualiza o status em arquivo a cada etapa (o server le isso em get_status) e,
@@ -737,7 +1194,7 @@ def run_job(cache_id: str, source: str, max_screenshots: int = 20,
 
     try:
         process(source, max_screenshots, cache_id=cache_id, progress=report,
-                do_ocr=do_ocr, caption_backend=caption_backend)
+                do_ocr=do_ocr, caption_backend=caption_backend, force=force)
         _merge_status(cache_id, stage="done", detail="", done=True, error=None, pid=None)
     except Exception as exc:
         log.exception("Job %s falhou", cache_id)
@@ -923,7 +1380,8 @@ def get_frame_from_cache(cache_id: str, timestamp: float) -> str:
 # Orquestracao
 # ===========================================================================
 def process(source: str, max_screenshots: int = 20, cache_id: str | None = None,
-            progress=None, do_ocr: bool = False, caption_backend: str | None = None) -> dict:
+            progress=None, do_ocr: bool = False, caption_backend: str | None = None,
+            force: bool = False) -> dict:
     """Executa o pipeline completo e guarda o resultado num cache persistente.
 
     Retorna dados estruturados (metadados, segmentos da transcricao, prints e
@@ -934,7 +1392,18 @@ def process(source: str, max_screenshots: int = 20, cache_id: str | None = None,
     presente e reusado para nao divergir do status; senao e calculado pelo titulo.
     `progress(stage, detail)` (opcional) e chamado a cada etapa para alimentar o
     acompanhamento em background (get_status).
+    `force`: reprocessa mesmo que a fonte ja tenha sido vista (senao AlreadySeenError).
     """
+    # Bloqueio de reprocessamento acidental: se ja vimos esta fonte, aborta ANTES
+    # de baixar. force=True pula o bloqueio (reprocessar de proposito).
+    if not force:
+        prev = is_seen(source)
+        if prev:
+            t = prev.get("title")
+            raise AlreadySeenError(
+                f"Fonte ja processada antes{f' ({t})' if t else ''}: {source}. "
+                "Use force=True para reprocessar."
+            )
     # ETA: a duracao do video (escrita pelo server no status) permite estimar o
     # tempo de cada etapa pelas taxas (historico/_default). `rates` = s por s-de-video.
     video_secs = 0.0
@@ -987,9 +1456,15 @@ def process(source: str, max_screenshots: int = 20, cache_id: str | None = None,
     work = tempfile.mkdtemp(prefix="vidtx_")  # area temporaria (audio/chunks)
     try:
         _p("download", "baixando video e metadados")
-        video_path, metadata = download_or_locate(
-            source, work,
-            progress=lambda fr, eta: _p("download", "baixando video", frac=fr, eta_cur=eta))
+        try:
+            video_path, metadata = download_or_locate(
+                source, work,
+                progress=lambda fr, eta: _p("download", "baixando video", frac=fr, eta_cur=eta))
+        except ImagePostError:
+            # Post so-imagem (carrossel/foto): ramo dedicado — baixa as fotos +
+            # legenda (gallery-dl) e monta a timeline sem audio. Sai do pipeline
+            # de video aqui (o finally ainda limpa a area temporaria criada acima).
+            return _process_image_post(source, cache_id, _p)
         if not video_secs:
             video_secs = float(metadata.get("duration") or 0)
 
@@ -1129,6 +1604,8 @@ def process(source: str, max_screenshots: int = 20, cache_id: str | None = None,
             "chapters": metadata.get("chapters"),
         })
         _prune_cache()
+        # Registra como visto (fonte canonica), para bloquear reprocessos futuros.
+        mark_seen(metadata.get("source") or source, metadata.get("title"))
         _p("done", "")
 
         return {

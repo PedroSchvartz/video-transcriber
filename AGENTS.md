@@ -1,0 +1,114 @@
+# video_transcriber — orientação para agentes
+
+Servidor MCP + CLI de transcrição de vídeo. Recebe uma URL (YouTube/Instagram) ou um
+`.mp4` e devolve uma **timeline**: a fala (com timestamps) e os **prints** dos momentos
+de mudança intercalados em ordem cronológica — como se o Codex tivesse assistido.
+
+## Pipeline
+
+`fonte (URL ou .mp4)` → probe (lê duração/título sem baixar) → download (yt-dlp, até
+1080p) → extração de áudio (ffmpeg, Opus) → transcrição (Groq Whisper; fallback
+`faster-whisper` local) → seleção de frames (fala/cena/edição/áudio/capítulo/intervalo,
+limiares auto-calibrados) → dedup (pHash/colorhash) → anotação opcional (OCR/descrição)
+→ **timeline** (fala + prints intercalados).
+
+Cada vídeo vira um cache em `_cache/<id>/` (mantém os 10 mais recentes), o que permite
+remontar a timeline e capturar novos instantes sem reprocessar.
+
+## Quando usar cada entry point
+
+| Arquivo | Quando usar |
+|---------|-------------|
+| `server.py` | **Servidor MCP** — usado pelo Codex. Fluxo: `process_video(source)` inicia em background e retorna um `cache_id` na hora (não trava em vídeos longos); acompanhe com `get_status(cache_id)`; quando pronto, pegue a timeline com `get_result(cache_id)`; `cancel(cache_id)` interrompe de verdade; `get_frame(cache_id, timestamp)` "rebobina" para qualquer instante. |
+| `transcribe.py` | **CLI standalone** — roda o pipeline direto no terminal, síncrono, sem IA. `python transcribe.py "<URL ou caminho .mp4>"` (sem argumento entra em modo interativo). Flags opcionais: `--screenshots/-s N`, `--ocr`, `--describe`, `--describe-backend auto|local|online`. Passo a passo completo em `USO_SEM_IA.md`. |
+
+## Setup
+
+```
+pip install -r requirements.txt
+winget install Gyan.FFmpeg          # uma vez só; o código localiza o binário sozinho
+```
+
+Chave Groq (opcional, recomendada — transcrição muito mais rápida e precisa): copie
+`.env.example` para `.env` e preencha `GROQ_API_KEY` (crie de graça em
+https://console.groq.com/keys). Sem a chave, usa `faster-whisper` local (mais lento,
+funciona offline).
+
+**Instagram exige cookies.** Hoje o IG retorna "empty media response" sem sessão
+logada (vale até para reel público). Solução: um `cookies.txt` (Netscape) — o
+`processor.py` detecta automaticamente `cookies.txt`/`*_cookies.txt` na pasta (ou o
+caminho em `VT_COOKIES_FILE` no `.env`) e o aplica **no probe e no download**. Gere
+com a extensão "Get cookies.txt LOCALLY" (Chrome logado no instagram.com). O
+`cookiesfrombrowser chrome` **não funciona** no Chrome moderno (criptografia
+app-bound, v127+) — por isso o arquivo é o caminho oficial. `cookies.txt` é
+credencial viva: está no `.gitignore`, nunca commitar. Mantenha o `yt-dlp` atualizado.
+
+Registrar o MCP no Codex (escopo global) e reiniciar:
+
+```
+Codex mcp add video-transcriber -s user -- python "C:\Codigos\claud_develop\tools\video_transcriber\server.py"
+```
+
+Confirme com `/mcp` que `video-transcriber` está ativo. Remover:
+`Codex mcp remove video-transcriber -s user`.
+
+**Anotação dos prints** (opcional, desligada por padrão — `--ocr` / `--describe`). As
+dependências são pesadas e ficam comentadas no `requirements.txt`; instale só se for
+usar:
+
+```
+pip install rapidocr-onnxruntime           # OCR (texto na tela) — leve, ONNX
+pip install torch transformers timm einops # descrição LOCAL (Florence-2) — ~2 GB (torch)
+```
+
+A descrição **na nuvem** (`--describe-backend online`) não exige nada disso: usa o
+pacote `groq` (já instalado) e a `GROQ_API_KEY`.
+
+## GROQ_API_KEY
+
+| Variável | Obrigatória | Para quê |
+|----------|-------------|----------|
+| `GROQ_API_KEY` | Não | Transcrição via Groq Whisper (free tier) e descrição de prints via Groq vision. Sem ela, transcrição cai no `faster-whisper` local. |
+
+Definida em `tools/video_transcriber/.env` — **nunca commitar** (está no `.gitignore`).
+
+## Arquivos principais
+
+| Arquivo | Papel |
+|---------|-------|
+| `server.py` | MCP server — tools `process_video`/`get_status`/`get_result`/`cancel`/`get_frame`; lança o worker e monta a timeline |
+| `transcribe.py` | CLI sem IA — roda o pipeline direto no terminal |
+| `worker.py` | Processo de background matável (um por job), atualiza o status |
+| `processor.py` | Pipeline (probe, download, áudio, transcrição, frames) + cache + status + `run_job`/`cancel` |
+| `frame_selector.py` | Seleção de timestamps (fala/cena/edição/áudio/capítulo/intervalo) + dedup |
+| `frame_annotators.py` | Anotação opcional dos prints — OCR (RapidOCR) + descrição (Florence-2 local ou Groq vision) |
+| `ffmpeg_tools.py` | Localiza ffmpeg/ffprobe no PATH |
+
+Docs de apoio: `README.md` (visão geral da ferramenta) e `USO_SEM_IA.md` (uso da CLI no
+terminal, sem IA).
+
+## Análise / experimentação (fora do pipeline)
+
+| Arquivo | Papel |
+|---------|-------|
+| `metrics_dump.py` | Batch de métricas sobre uma **coleção** de vídeos → 1 linha CSV por vídeo (~45 colunas), para tirar conclusões com dados. **Fase A** (sem chave, ~s/vídeo): container, áudio (volume/silêncio), assinatura de mudança por blocos (rest/static/localização/recorrência), brilho, proxy de texto (bordas) e de movimento global (correlação de fase). **Fase B** (`--transcript`/`--vision`/`--all`, usa `GROQ_API_KEY`, **envia ao Groq**): words/min + cobertura de fala; categoria + rosto + texto (1 chamada de visão/vídeo sobre colagem). Uso: `python metrics_dump.py <pasta \| lista.txt \| vídeos> [-o saida.csv] [--all]`. |
+| `focus_locator.py` | Localizador de foco por **trecho** (não por vídeo): desliza uma janela e emite **spans de foco rotulados** (`estatico` / `slide_pip`) com a região estudável (bbox) e flag `suspeito_card`. Reusa os primitivos do `metrics_dump` (mesmo scan por blocos). Resolve dois pontos cegos do escalar por vídeo: granularidade (vídeo que troca de regime) e estrutura **espacial** (`slide_pip` = canvas estudável com distrator localizado, ex.: aula com webcam num canto, que derruba o `rest` global). `--vision` (opt-in, **envia ao Groq**) confirma cada span (slide com conteúdo vs card morto). API: `locate_focus_spans(source)`. Uso: `python focus_locator.py <URL \| vídeo> [--json out.json] [--vision]`. |
+| `stream_selector.py` | Seleção de frames **incremental** (modo online/stream), irmã do `frame_selector` para fonte ao vivo sem fim (ex.: tela do celular via scrcpy). Detecção de mudança **auto-recalibrante** (EMA da fração suja + piso absoluto), warmup, emit retrospectivo com histerese (só emite tela **assentada**, sem spam em movimento contínuo), dedup por janela limitada e `marks_from_events` (ação no lugar da fala). Source-agnostic: consome `(t, frame)`. Branch `feat/modo-online-stream`; validado em stream sintético. Ver `planning/modo_online.md`. |
+| `stream_android.py` | Adaptador AO VIVO: tela do **Android** (via `ponte_android`) → `OnlineSelector`. Camada fina que produz `(t_pc, frame)` da tela do celular e salva os frames que assentaram (mudança deduplicada) numa pasta. `--drive` dirige o próprio aparelho (home/recent) p/ gerar mudanças de tela no teste, sem tocar no celular. Só visual (sem áudio). Uso: `python stream_android.py [--serial S] [--seconds N] [--fps F] [--out DIR] [--drive]`. Branch `feat/modo-online-stream`. |
+| `stream_desktop.py` | Adaptador AO VIVO: **tela do PC** (`PIL.ImageGrab`) → `OnlineSelector`, **com narração**. Multithread: captura visual + áudio (mic e/ou loopback do sistema via `soundcard`, escolhido em runtime `--audio none\|mic\|system\|both`) transcrito ao vivo em pedaços (`processor.transcribe`, Groq→local) numa `timeline.md` que cresce (fala + prints intercalados pelo relógio-PC). Reusa a calibração **perfil TELA** do `stream_selector`. Estágios via flag (`--audio none`=só visual; `--no-transcribe`=captura sem transcrever). Sem `--seconds` roda até Ctrl+C. Uso: `python stream_desktop.py [--audio both] [--seconds N] [--fps F] [--chunk S] [--out DIR]`. Branch `feat/modo-online-stream`. |
+| `screen_match.py` | Comparador de telas p/ **IA navegando UI** (via `ponte_android`): biblioteca de telas rotuladas + `match` que responde "em qual tela conhecida estou / quanto igual?" (Opção 1) e "o que mudou e onde?" (Opção 2 — **crop + coordenadas + texto da zona** via `frame_annotators.ocr_region`, sem contagem de pixels). Reusa `T_COR`/`BLOCK_HOT` do `metrics_dump` + localizador por blocos (grade flexível ao aspecto/retrato) + componentes conexos (BFS). Biblioteca persistente opcional (`--context`). A ferramenta **fornece**, a IA **decide**. API `ScreenLibrary`; CLI `python screen_match.py register\|match ... --json`. Branch `feat/modo-online-stream`. |
+
+Servem para investigar **quando** uma futura "ferramenta de foco" seria útil. **Tese-mãe:**
+"foco" não está nos pixels — está na relação intenção↔conteúdo; há resposta certa só nos
+extremos (puro-dinâmico = não-foco), no meio dissolve. A ferramenta deve **localizar e
+rotular** candidatos (`focus_locator`), não fazer gatekeeping. Hierarquia de sinais
+(validada n=31 + 3 vídeos de transição): `rest`/`d_mean` por janela **decidem**;
+`static_blocks`/`bbox` (espacial) e a visão (semântico — `rest` mede imobilidade, não
+informatividade) **confirmam**.
+
+## Não mexa
+
+- **`_cache/`** — artefatos gerados (vídeos, frames, transcripts, `meta.json`,
+  `result.json`, timings). Nunca commitar, nunca editar à mão.
+- **`_test_*` / `_run_real.py` / `_prescan.py`** — scripts de teste/diagnóstico avulsos, fora do pipeline (no `.gitignore`).
+- **`.env`** — contém `GROQ_API_KEY`. Nunca commitar.

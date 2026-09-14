@@ -192,9 +192,12 @@ def _timeline_blocks(meta: dict, segments: list, frames: list,
     if end < n:
         footer = (f'\n_Prints {start + 1}–{end} de {n}. Para os proximos: '
                   f'get_result(cache_id="{cache_id}", start={end})._')
-    else:
+    elif meta.get("video_path"):
         footer = (f'\n_Prints {start + 1}–{end} de {n} (fim). Para outro instante: '
                   f'get_frame(cache_id="{cache_id}", timestamp="mm:ss")._')
+    else:
+        # Post de imagem: nao ha video para "rebobinar" (get_frame nao se aplica).
+        footer = f'\n_Prints {start + 1}–{end} de {n} (fim)._'
     blocks.append(TextContent(type="text", text=footer))
     return blocks
 
@@ -256,7 +259,8 @@ def _resolve_describe_backend(describe: bool, prefer: str) -> str | None:
 
 @mcp.tool()
 def process_video(source: str, max_screenshots: int = 20, ocr: bool = False,
-                  describe: bool = False, describe_backend: str = "auto") -> list:
+                  describe: bool = False, describe_backend: str = "auto",
+                  force: bool = False) -> list:
     """Inicia a transcricao de um video em BACKGROUND e retorna na hora.
 
     O processamento pesado (download, transcricao, prints) roda num processo
@@ -276,6 +280,9 @@ def process_video(source: str, max_screenshots: int = 20, ocr: bool = False,
         describe_backend: 'auto' (padrao — prefere a NUVEM Groq; nao roda o modelo
             local pesado sem permissao), 'groq' (nuvem) ou 'local' (Florence-2; so
             se a RAM estiver folgada, senao cai p/ a nuvem).
+        force: se True, reprocessa mesmo que a fonte ja tenha sido vista antes. Por
+            padrao (False) um video ja processado e BLOQUEADO, para nao reassistir
+            por acidente — passe force=True so quando o reprocesso for intencional.
     """
     caption_backend = _resolve_describe_backend(describe, describe_backend)
     log.info("process_video: source=%s max_screenshots=%s ocr=%s describe=%s backend=%s",
@@ -292,6 +299,19 @@ def process_video(source: str, max_screenshots: int = 20, ocr: bool = False,
             f"Video muito longo ({processor.fmt_time(duration)}). Limite de seguranca: "
             f"{processor.fmt_time(processor.MAX_DURATION_HARD)}. Corte um trecho antes."
         ))]
+
+    # Bloqueio de reprocessamento: se ja vimos esta fonte, nem lanca o worker.
+    # Checa a canonica (meta["source"], sem query) e a crua colada — _normalize_source
+    # colapsa ambas na mesma identidade. force=True pula o bloqueio.
+    if not force:
+        prev = processor.is_seen(meta.get("source") or source) or processor.is_seen(source)
+        if prev:
+            t = prev.get("title")
+            return [TextContent(type="text", text=(
+                f"Ja processei este video antes{f' ({t})' if t else ''}. Pulei para nao "
+                "reassistir por acidente.\nPara reprocessar de proposito, chame "
+                "process_video(source, force=True)."
+            ))]
 
     title = meta.get("title") or "video"
     cache_id = processor.make_cache_id(title, source)
@@ -318,7 +338,7 @@ def process_video(source: str, max_screenshots: int = 20, ocr: bool = False,
     try:
         proc = _spawn_worker([sys.executable, WORKER_SCRIPT, cache_id, source,
                               str(max_screenshots), "1" if ocr else "0",
-                              caption_backend or ""])
+                              caption_backend or "", "1" if force else "0"])
     except Exception as exc:
         log.exception("Falha ao lancar o worker")
         processor._merge_status(cache_id, stage="error", done=True, error=str(exc), pid=None)
@@ -327,7 +347,11 @@ def process_video(source: str, max_screenshots: int = 20, ocr: bool = False,
     processor.set_pid(cache_id, proc.pid)
 
     dur_txt = processor.fmt_time(duration) if duration else "desconhecida"
+    # Aviso proativo de validade dos cookies do Instagram (perto de expirar etc.).
+    warn = processor.cookie_warning(source)
+    prefix = f"⚠️ {warn}\n\n" if warn else ""
     return [TextContent(type="text", text=(
+        f"{prefix}"
         f"Processando **{title}** (duracao {dur_txt}) em background.\n"
         f"**cache_id:** `{cache_id}`\n\n"
         f'Acompanhe com get_status(cache_id="{cache_id}"); ao concluir, pegue a '

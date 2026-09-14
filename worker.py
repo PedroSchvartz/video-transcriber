@@ -3,8 +3,9 @@
 Roda como processo proprio (lancado por server.process_video) para que o
 cancel possa mata-lo — e aos ffmpeg/yt-dlp filhos — sem derrubar o server MCP.
 
-Uso:  python worker.py <cache_id> <source> [max_screenshots] [ocr 0|1] [caption_backend]
+Uso:  python worker.py <cache_id> <source> [max_screenshots] [ocr 0|1] [caption_backend] [force 0|1]
       caption_backend: '' (sem descricao) | 'florence' (local) | 'groq' (nuvem)
+      force: '1' reprocessa mesmo que a fonte ja tenha sido vista
 """
 import logging
 import os
@@ -24,6 +25,7 @@ if __name__ == "__main__":
     max_screenshots = int(sys.argv[3]) if len(sys.argv) > 3 else 20
     do_ocr = len(sys.argv) > 4 and sys.argv[4] == "1"
     caption_backend = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
+    force = len(sys.argv) > 6 and sys.argv[6] == "1"
 
     # O server lanca o worker destacado, com stdout/stderr -> DEVNULL. Sem um log
     # em arquivo, uma morte do worker no meio do job nao deixaria rastro nenhum
@@ -37,4 +39,4 @@ if __name__ == "__main__":
     )
 
     processor.run_job(cache_id, source, max_screenshots, do_ocr=do_ocr,
-                      caption_backend=caption_backend)
+                      caption_backend=caption_backend, force=force)

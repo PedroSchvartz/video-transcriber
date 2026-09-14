@@ -15,6 +15,13 @@ limiares auto-calibrados) → dedup (pHash/colorhash) → anotação opcional (O
 Cada vídeo vira um cache em `_cache/<id>/` (mantém os 10 mais recentes), o que permite
 remontar a timeline e capturar novos instantes sem reprocessar.
 
+**Post/carrossel de imagem do Instagram** (URL `/p/…` sem vídeo): o yt-dlp recusa com
+"No video formats found" — não é erro, é conteúdo sem faixa de vídeo. O pipeline detecta
+esse sinal e **desvia para o `gallery-dl`** (mesmo `cookies.txt`), que baixa as fotos do
+carrossel. A timeline vira **legenda (texto em t=0) + as imagens como prints em ordem**,
+sem áudio/transcrição. `get_frame` não se aplica (não há vídeo; `video_path` fica `None`).
+Miolo em `processor.py`: `ImagePostError` → `download_images` → `_process_image_post`.
+
 ## Quando usar cada entry point
 
 | Arquivo | Quando usar |
@@ -33,6 +40,15 @@ Chave Groq (opcional, recomendada — transcrição muito mais rápida e precisa
 `.env.example` para `.env` e preencha `GROQ_API_KEY` (crie de graça em
 https://console.groq.com/keys). Sem a chave, usa `faster-whisper` local (mais lento,
 funciona offline).
+
+**Instagram exige cookies.** Hoje o IG retorna "empty media response" sem sessão
+logada (vale até para reel público). Solução: um `cookies.txt` (Netscape) — o
+`processor.py` detecta automaticamente `cookies.txt`/`*_cookies.txt` na pasta (ou o
+caminho em `VT_COOKIES_FILE` no `.env`) e o aplica **no probe e no download**. Gere
+com a extensão "Get cookies.txt LOCALLY" (Chrome logado no instagram.com). O
+`cookiesfrombrowser chrome` **não funciona** no Chrome moderno (criptografia
+app-bound, v127+) — por isso o arquivo é o caminho oficial. `cookies.txt` é
+credencial viva: está no `.gitignore`, nunca commitar. Mantenha o `yt-dlp` atualizado.
 
 Registrar o MCP no Claude Code (escopo global) e reiniciar:
 
@@ -85,6 +101,8 @@ terminal, sem IA).
 | `metrics_dump.py` | Batch de métricas sobre uma **coleção** de vídeos → 1 linha CSV por vídeo (~45 colunas), para tirar conclusões com dados. **Fase A** (sem chave, ~s/vídeo): container, áudio (volume/silêncio), assinatura de mudança por blocos (rest/static/localização/recorrência), brilho, proxy de texto (bordas) e de movimento global (correlação de fase). **Fase B** (`--transcript`/`--vision`/`--all`, usa `GROQ_API_KEY`, **envia ao Groq**): words/min + cobertura de fala; categoria + rosto + texto (1 chamada de visão/vídeo sobre colagem). Uso: `python metrics_dump.py <pasta \| lista.txt \| vídeos> [-o saida.csv] [--all]`. |
 | `focus_locator.py` | Localizador de foco por **trecho** (não por vídeo): desliza uma janela e emite **spans de foco rotulados** (`estatico` / `slide_pip`) com a região estudável (bbox) e flag `suspeito_card`. Reusa os primitivos do `metrics_dump` (mesmo scan por blocos). Resolve dois pontos cegos do escalar por vídeo: granularidade (vídeo que troca de regime) e estrutura **espacial** (`slide_pip` = canvas estudável com distrator localizado, ex.: aula com webcam num canto, que derruba o `rest` global). `--vision` (opt-in, **envia ao Groq**) confirma cada span (slide com conteúdo vs card morto). API: `locate_focus_spans(source)`. Uso: `python focus_locator.py <URL \| vídeo> [--json out.json] [--vision]`. |
 | `stream_selector.py` | Seleção de frames **incremental** (modo online/stream), irmã do `frame_selector` para fonte ao vivo sem fim (ex.: tela do celular via scrcpy). Detecção de mudança **auto-recalibrante** (EMA da fração suja + piso absoluto), warmup, emit retrospectivo com histerese (só emite tela **assentada**, sem spam em movimento contínuo), dedup por janela limitada e `marks_from_events` (ação no lugar da fala). Source-agnostic: consome `(t, frame)`. Branch `feat/modo-online-stream`; validado em stream sintético. Ver `planning/modo_online.md`. |
+| `stream_android.py` | Adaptador AO VIVO: tela do **Android** (via `ponte_android`) → `OnlineSelector`. Camada fina que produz `(t_pc, frame)` da tela do celular e salva os frames que assentaram (mudança deduplicada) numa pasta. `--drive` dirige o próprio aparelho (home/recent) p/ gerar mudanças de tela no teste, sem tocar no celular. Só visual (sem áudio). Uso: `python stream_android.py [--serial S] [--seconds N] [--fps F] [--out DIR] [--drive]`. Branch `feat/modo-online-stream`. |
+| `stream_desktop.py` | Adaptador AO VIVO: **tela do PC** (`PIL.ImageGrab`) → `OnlineSelector`, **com narração**. Multithread: captura visual + áudio (mic e/ou loopback do sistema via `soundcard`, escolhido em runtime `--audio none\|mic\|system\|both`) transcrito ao vivo em pedaços (`processor.transcribe`, Groq→local) numa `timeline.md` que cresce (fala + prints intercalados pelo relógio-PC). Reusa a calibração **perfil TELA** do `stream_selector`. Estágios via flag (`--audio none`=só visual; `--no-transcribe`=captura sem transcrever). Sem `--seconds` roda até Ctrl+C. Uso: `python stream_desktop.py [--audio both] [--seconds N] [--fps F] [--chunk S] [--out DIR]`. Branch `feat/modo-online-stream`. |
 | `screen_match.py` | Comparador de telas p/ **IA navegando UI** (via `ponte_android`): biblioteca de telas rotuladas + `match` que responde "em qual tela conhecida estou / quanto igual?" (Opção 1) e "o que mudou e onde?" (Opção 2 — **crop + coordenadas + texto da zona** via `frame_annotators.ocr_region`, sem contagem de pixels). Reusa `T_COR`/`BLOCK_HOT` do `metrics_dump` + localizador por blocos (grade flexível ao aspecto/retrato) + componentes conexos (BFS). Biblioteca persistente opcional (`--context`). A ferramenta **fornece**, a IA **decide**. API `ScreenLibrary`; CLI `python screen_match.py register\|match ... --json`. Branch `feat/modo-online-stream`. |
 
 Servem para investigar **quando** uma futura "ferramenta de foco" seria útil. **Tese-mãe:**

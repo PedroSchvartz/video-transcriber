@@ -113,6 +113,25 @@ Salvaguardas dessa etapa:
    - Crie de graça em https://console.groq.com/keys (sem cartão)
    - Copie `.env.example` para `.env` e cole a chave em `GROQ_API_KEY=`
    - **Sem chave**, a ferramenta usa `faster-whisper` local (mais lento, já funciona).
+4. **Cookies do Instagram** (necessário para vídeos do Instagram): hoje o Instagram
+   exige sessão logada até para muito conteúdo público (retorna *"empty media
+   response"* sem login). O jeito robusto é um arquivo **`cookies.txt`** (não depende
+   do Chrome aberto nem sofre com a criptografia app-bound do Chrome moderno, que
+   inviabiliza ler os cookies direto do navegador):
+   - Instale a extensão **"Get cookies.txt LOCALLY"** no Chrome.
+   - Abra o `instagram.com` **logado** e exporte o `cookies.txt`.
+   - Salve como **`cookies.txt`** na pasta `tools/video_transcriber/` (ou aponte
+     `VT_COOKIES_FILE=<caminho>` no `.env`). O tool detecta e usa automaticamente,
+     tanto no probe quanto no download.
+   - O `cookies.txt` é uma **credencial de sessão** — já está no `.gitignore`,
+     **nunca** commite. A sessão do Instagram dura ~1 ano, então re-exportar é raro.
+   - **Aviso automático de validade**: o tool lê o vencimento do `sessionid` e avisa
+     de forma proativa (no MCP e na CLI) quando os cookies estão **ausentes**,
+     **expirados** ou **a menos de 14 dias** de vencer — nunca falha "do nada". A
+     mensagem de erro do download também distingue os três casos (sem cookies /
+     expirados / válidos na data mas sessão invalidada).
+   - Mantenha o **yt-dlp atualizado** (`pip install -U yt-dlp`): quebras do Instagram
+     costumam ser corrigidas nas versões novas.
 
 ## Registro no Claude Code
 

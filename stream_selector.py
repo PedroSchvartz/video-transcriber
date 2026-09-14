@@ -34,18 +34,22 @@ from dataclasses import dataclass
 
 import numpy as np
 
+import config
 import frame_selector as fs
 
 log = logging.getLogger("video_transcriber.stream")
 
 # --- Parametros do modo online --------------------------------------------
-DETECT_SIZE = fs.EDIT_SIZE          # downscale quadrado p/ medir mudanca (128)
+# Os valores efetivos vem do config (VT_STREAM_* / config.json), perfil TELA; ver
+# planning/config_parametros.md. As constantes abaixo sao a ULTIMA rede (fallback
+# se a chave sumir do config) e documentam a origem de cada default.
+DETECT_SIZE = fs.EDIT_SIZE          # downscale quadrado p/ medir mudanca (128); nao exposto (custo/robustez, nao "tuning")
 T_COR_LIVE = fs.DEDUP_T_COR         # piso de cor por pixel. Screencast e sinal DIGITAL
                                     # limpo: ruido por pixel ~constante e baixo, ao
-                                    # contrario de camera. Atalho consciente: fixo aqui
-                                    # (adaptar seria YAGNI ate uma fonte ruidosa provar
-                                    # o contrario; a receita auto-medida do batch,
-                                    # T_cor do p99-dos-quietos, segue no caminho gravado).
+                                    # contrario de camera. Agora configuravel
+                                    # (VT_STREAM_T_COR) p/ fontes ruidosas; a receita
+                                    # auto-medida do batch (p99-dos-quietos) segue no
+                                    # caminho gravado.
 WARMUP_S = 2.0                      # nao emite antes disso (baseline fria)
 TAU_CALIB = 8.0                     # constante de tempo (s) da EMA de calibracao de area
 AREA_K = fs.EDIT_AREA_K             # limiar de area = EMA_media + K*EMA_desvio
@@ -94,16 +98,21 @@ class OnlineSelector:
     fecha um grupo pendente.
     """
 
-    def __init__(self, *, t_cor: float = T_COR_LIVE, warmup_s: float = WARMUP_S,
-                 tau: float = TAU_CALIB, area_k: float = AREA_K,
-                 area_floor: float = AREA_FLOOR, min_gap: float = MIN_GAP,
-                 dedup_window: int = DEDUP_WINDOW):
-        self.t_cor = t_cor
-        self.warmup_s = warmup_s
-        self.tau = tau
-        self.area_k = area_k
-        self.area_floor = area_floor
-        self.min_gap = min_gap
+    def __init__(self, *, t_cor: float | None = None, warmup_s: float | None = None,
+                 tau: float | None = None, area_k: float | None = None,
+                 area_floor: float | None = None, min_gap: float | None = None,
+                 dedup_window: int | None = None):
+        # None = usar o config (VT_STREAM_* / config.json); argumento explicito vence.
+        # Lido no __init__ (nao no import) p/ refletir overrides de runtime, igual ao batch.
+        cfg = config.load()
+        self.t_cor = float(cfg["stream_t_cor"]) if t_cor is None else t_cor
+        self.warmup_s = float(cfg["stream_warmup_s"]) if warmup_s is None else warmup_s
+        self.tau = float(cfg["stream_tau_calib_s"]) if tau is None else tau
+        self.area_k = float(cfg["stream_area_k"]) if area_k is None else area_k
+        self.area_floor = float(cfg["stream_area_floor"]) if area_floor is None else area_floor
+        self.min_gap = float(cfg["stream_min_gap_s"]) if min_gap is None else min_gap
+        if dedup_window is None:
+            dedup_window = int(cfg["stream_dedup_window"])
 
         self._t0: float | None = None
         self._prev_small: np.ndarray | None = None   # frame anterior downscale (float)

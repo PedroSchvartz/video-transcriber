@@ -338,6 +338,11 @@ def main() -> None:
     # e o custo - ja refletindo o backend resolvido (local x Groq vision).
     _print_services(source, do_ocr, caption_backend)
 
+    # Aviso proativo de validade dos cookies do Instagram (ausente/expirado/perto).
+    _cookie_warn = processor.cookie_warning(source)
+    if _cookie_warn:
+        print(f"\n[!] {_cookie_warn}\n")
+
     # Probe best-effort: mostra a duracao e barra videos absurdamente longos
     # antes de comprometer download + processamento (mesmo guard rail do server).
     try:

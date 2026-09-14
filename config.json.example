@@ -6,5 +6,14 @@
 
   "max_duration_hours": 4.0,
   "max_cache_entries": 10,
-  "silence_threshold_dbfs": -50.0
+  "silence_threshold_dbfs": -50.0,
+
+  "_comentario_stream": "Modo online / stream (perfil TELA: PC/Android). Ver planning/config_parametros.md.",
+  "stream_t_cor": 50.0,
+  "stream_warmup_s": 2.0,
+  "stream_tau_calib_s": 8.0,
+  "stream_area_k": 2.0,
+  "stream_area_floor": 0.02,
+  "stream_min_gap_s": 0.8,
+  "stream_dedup_window": 8
 }

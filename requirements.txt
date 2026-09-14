@@ -1,11 +1,13 @@
 mcp>=1.0.0          # SDK do MCP server
-yt-dlp              # Download YouTube / Instagram + metadados/capitulos
+yt-dlp              # Download YouTube / Instagram (video) + metadados/capitulos
+gallery-dl          # Download de post/carrossel de IMAGEM do Instagram (yt-dlp so pega video)
 groq                # Whisper Large v3 Turbo (216x realtime, free tier)
 faster-whisper      # Fallback local (arquivo grande ou sem chave Groq)
 imagehash           # pHash para deduplicar frames quase identicos
 Pillow              # Manipulacao de imagens
 numpy               # Medida de nitidez (variancia do Laplaciano) na escolha do frame
 python-dotenv       # Carrega GROQ_API_KEY do .env
+soundcard           # Captura de audio ao vivo (mic + loopback do sistema) no stream_desktop
 
 # --- Anotacao OPCIONAL dos prints (--ocr / --describe). Pesadas (o Florence-2
 # puxa torch); instale so se for usar. Sem elas, o passo e pulado com aviso. ---

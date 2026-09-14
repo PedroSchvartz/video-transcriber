@@ -1,4 +1,16 @@
 .env
+
+# Cookies de sessao (Instagram etc.) — credencial viva, NUNCA commitar
+cookies.txt
+instagram_cookies.txt
+www.instagram.com_cookies.txt
+*_cookies.txt
+
+# Fragmentos temporarios de download do yt-dlp (fora do _cache)
+tn.*
+*.temp.webm
+*.temp.mp4
+
 __pycache__/
 *.pyc
 _test_*

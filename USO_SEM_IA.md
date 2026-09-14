@@ -5,6 +5,7 @@ chat e ele monta a timeline. Mas o motor — **baixar → extrair áudio → tra
 → capturar prints** — roda sozinho. Este guia mostra como usá-lo direto no
 terminal, **sem nenhuma IA envolvida**.
 
+https://www.instagram.com/reel/Dbn_y-9uhGu/?utm_source=ig_web_copy_link&igsh=MzRlODBiNWFlZA==
 ---
 
 ## 1. Pré-requisitos (uma vez só)
@@ -31,7 +32,7 @@ terminal, **sem nenhuma IA envolvida**.
    (já instalado) e a sua `GROQ_API_KEY`. Sem RAM nem `torch`.
 
 ---
-
+python transcribe.py "https://www.youtube.com/live/b7IciS-b30A?is=WlXHr6Rw365zzJrg"
 ## 2. Rodar
 
 ```
