@@ -22,6 +22,23 @@ carrossel. A timeline vira **legenda (texto em t=0) + as imagens como prints em 
 sem áudio/transcrição. `get_frame` não se aplica (não há vídeo; `video_path` fica `None`).
 Miolo em `processor.py`: `ImagePostError` → `download_images` → `_process_image_post`.
 
+**Download truncado do YouTube** (decisão de 2026-09-25): em alguns vídeos o YouTube
+serve o formato 18 cortado (~107 KB de ~9 MB) e o yt-dlp diz sucesso; o áudio sai com
+347 bytes e a transcrição estourava como 400 da Groq + `EOFError` do faster-whisper.
+DASH dá 403 (PO token) e trocar de client (android/android_vr/default) não muda nada.
+O ffprobe do contêiner **não** denuncia (o cabeçalho vem inteiro, diz a duração cheia):
+detectamos pelo **tamanho** (vs `filesize`/`filesize_approx`) ou pela **duração do áudio
+extraído** (vs a do vídeo), limiar `TRUNCATED_RATIO` (50%). Truncado → transcrição pelas
+**legendas** do YouTube (json3 já presente na info do download), sem prints e com
+`video_path` `None` no meta; sem legenda → `TruncatedDownloadError` com a causa real.
+Casos conhecidos: `LSZCkC0k93s`, `8QuBUY1dW-M`, `T9ULtzQLw-k`, `hM6i_r4CdUw`,
+`opooBP1dNJY`, `r7TDaa6GLVk`.
+
+## Testes
+
+`python -m unittest discover -s tests` (da pasta da ferramenta; stdlib, sem rede/ffmpeg,
+`_cache` isolado em pasta temporária). Mudou o comportamento do pipeline → teste junto.
+
 ## Quando usar cada entry point
 
 | Arquivo | Quando usar |

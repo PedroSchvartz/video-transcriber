@@ -522,8 +522,90 @@ def download_or_locate(source: str, workdir: str, progress=None) -> tuple[str, d
         "chapters": info.get("chapters"),
         "duration": info.get("duration"),
         "source": info.get("webpage_url") or source,
+        # p/ detectar download truncado e cair nas legendas (ver _truncation_note)
+        "filesize": info.get("filesize") or info.get("filesize_approx"),
+        "caption": _pick_caption(info),
     }
     return video_path, metadata
+
+
+# === Download truncado (YouTube) ===========================================
+# Em alguns videos o YouTube serve o formato 18 CORTADO (ex.: 109 KB de ~9.7 MB)
+# e o yt-dlp reporta sucesso. O ffprobe do conteiner ainda diz a duracao cheia
+# (o cabecalho veio inteiro), entao so o TAMANHO do arquivo ou a duracao do AUDIO
+# extraido denunciam. Os formatos DASH dao 403 (PO token) e trocar de client nao
+# muda nada (validado em 2026-09) — o que resta e usar as legendas do proprio
+# YouTube (vem na info do download, sem request extra) ou falhar com mensagem clara.
+TRUNCATED_RATIO = 0.5   # abaixo de 50% do esperado = truncado. Folgado de proposito:
+                        # filesize_approx e estimativa; o caso real fica em ~1%.
+
+
+class TruncatedDownloadError(RuntimeError):
+    """A plataforma entregou o video incompleto e nao ha legenda para substituir."""
+
+
+def _truncation_note(got: float, expected, unit: str) -> str | None:
+    """Descricao do truncamento ('0.1 MB de ~9.7 MB esperados') ou None se ok/sem referencia."""
+    if expected and got < TRUNCATED_RATIO * float(expected):
+        return f"{got:.1f} {unit} de ~{float(expected):.1f} {unit} esperados"
+    return None
+
+
+def _pick_caption(info: dict) -> tuple[str, str] | None:
+    """(idioma, url json3) da melhor legenda: manual no idioma do video > automatica
+    original (-orig) > automatica no idioma > qualquer -orig. None se nao houver.
+    Mesma prioridade de estudo/ingest.py:_escolher_legenda."""
+    lang = (info.get("language") or "").split("-")[0]
+    manual, auto = info.get("subtitles") or {}, info.get("automatic_captions") or {}
+    for fonte, filtro in ((manual, lambda k: lang and k.startswith(lang)),
+                          (auto, lambda k: lang and k == f"{lang}-orig"),
+                          (auto, lambda k: lang and k.startswith(lang)),
+                          (auto, lambda k: k.endswith("-orig"))):
+        for k, fmts in fonte.items():
+            url = next((f.get("url") for f in fmts if f.get("ext") == "json3"), None)
+            if filtro(k) and url:
+                return k, url
+    return None
+
+
+def _json3_segments(data: dict) -> list[dict]:
+    """Eventos json3 do YouTube -> [{start,end,text}] (s). Ignora janelas sem texto."""
+    segs = []
+    for ev in data.get("events", []):
+        text = " ".join("".join(s.get("utf8", "") for s in ev.get("segs") or []).split())
+        if text:
+            start = ev["tStartMs"] / 1000
+            segs.append({"start": start, "end": start + ev.get("dDurationMs", 0) / 1000,
+                         "text": text})
+    return segs
+
+
+def _caption_transcript(metadata: dict, note: str, source: str) -> dict:
+    """Transcricao a partir das legendas do YouTube quando o download veio truncado.
+    Sem legenda utilizavel -> TruncatedDownloadError com a causa real (em vez do
+    EOFError/400 que o audio vazio provocaria na transcricao)."""
+    import urllib.request
+
+    cap = metadata.get("caption")
+    if cap:
+        lang, url = cap
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                segs = _json3_segments(json.load(r))
+        except Exception as exc:
+            log.warning("Falha ao baixar as legendas do YouTube (%s): %s", lang, exc)
+            segs = []
+        if segs:
+            log.warning("Download truncado (%s); usando as legendas do YouTube (%s).", note, lang)
+            return {"text": " ".join(s["text"] for s in segs), "segments": segs, "words": [],
+                    "engine": f"legendas do YouTube ({lang}) — video veio truncado, sem prints"}
+    raise TruncatedDownloadError(
+        f"A plataforma entregou o video INCOMPLETO ({note}), embora o download tenha "
+        f"reportado sucesso: {source}. Nao e falha local — o YouTube as vezes serve o "
+        "formato 18 cortado, e os demais formatos exigem PO token. Nao ha legendas para "
+        "usar no lugar. Tente de novo mais tarde, ou baixe o .mp4 por outro meio e "
+        "processe o arquivo local."
+    )
 
 
 def probe_source(source: str) -> dict:
@@ -1493,10 +1575,23 @@ def process(source: str, max_screenshots: int = 20, cache_id: str | None = None,
                 f"formato nao suportado): {source}. Tente outro arquivo ou baixe de novo."
             )
 
-        _p("audio", "extraindo audio (opus)")
-        audio_path = extract_audio(video_path, work)
-        _p("transcribe", "transcrevendo a fala")
-        transcript = transcribe(audio_path, work)
+        # Download truncado (ver TRUNCATED_RATIO): o tamanho denuncia ja; senao, a
+        # duracao do audio extraido. Truncado -> legendas do YouTube, sem prints.
+        truncated = _truncation_note(os.path.getsize(video_path) / 1e6,
+                                     (metadata.get("filesize") or 0) / 1e6, "MB")
+        audio_path = None
+        if not truncated:
+            _p("audio", "extraindo audio (opus)")
+            audio_path = extract_audio(video_path, work)
+            if audio_path:
+                truncated = _truncation_note(get_duration(audio_path), duration, "s de audio")
+        if truncated:
+            _p("transcribe", "video veio truncado: usando as legendas do YouTube")
+            transcript = _caption_transcript(metadata, truncated, source)
+            max_screenshots = 0   # o video nao tem o conteudo: nada para printar
+        else:
+            _p("transcribe", "transcrevendo a fala")
+            transcript = transcribe(audio_path, work)
         if not video_secs:
             video_secs = float(duration or 0)
 
@@ -1600,7 +1695,8 @@ def process(source: str, max_screenshots: int = 20, cache_id: str | None = None,
             "source": metadata.get("source"),
             "duration": duration,
             "engine": transcript.get("engine"),
-            "video_path": os.path.abspath(video_path),
+            # truncado: get_frame so acharia os primeiros segundos — melhor "indisponivel"
+            "video_path": None if truncated else os.path.abspath(video_path),
             "chapters": metadata.get("chapters"),
         })
         _prune_cache()
