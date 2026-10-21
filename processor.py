@@ -37,11 +37,13 @@ ffmpeg_tools.ensure_on_path()
 # --- Parametros ------------------------------------------------------------
 __version__ = "1.10.0"               # versao do pipeline; carimbada no meta.json
 GROQ_MODEL = "whisper-large-v3-turbo"
-LOCAL_MODEL = "large-v3-turbo"       # faster-whisper de fallback: turbo = quase a
-                                     # qualidade do large-v3 (multilingue/PT-BR forte)
-                                     # a ~4x a velocidade. Pesos ~1.6GB (baixados na 1a
-                                     # vez); em CPU pode nao acompanhar o ao vivo — se
-                                     # travar, caia p/ "small". Groq segue preferido.
+LOCAL_MODEL = "small"                # faster-whisper de fallback. "small" (~460MB int8,
+                                     # multilingue/PT-BR) e o teto pratico em CPU nesta
+                                     # maquina: "large-v3-turbo" (~1.6GB) estourou a RAM
+                                     # (mkl_malloc: failed to allocate memory). Ainda bem
+                                     # acima de "base" na qualidade. Com GROQ_API_KEY
+                                     # valida, a transcricao vai pra nuvem e o local nem
+                                     # roda — esse e o caminho de qualidade de verdade.
 GROQ_SIZE_LIMIT = 24 * 1024 * 1024   # 24 MB — abaixo do limite free de 25 MB
 CHUNK_SECONDS = 600                  # 10 min por pedaco quando o audio e longo
 FRAME_MAX_WIDTH = 1080               # largura maxima do print (reduz base64)
@@ -1030,7 +1032,7 @@ def transcribe_local(audio_path: str) -> dict:
         model = WhisperModel(LOCAL_MODEL, device="cpu", compute_type="int8")
     except Exception as exc:
         # O modelo e local apos a 1a vez, mas a 1a carga BAIXA os pesos do Hugging
-        # Face (large-v3-turbo ~1.6GB). Sem conexao e sem cache, esse e o unico ponto
+        # Face (small ~460MB). Sem conexao e sem cache, esse e o unico ponto
         # que precisa de rede no modo local — e nao ha outro fallback. Mensagem clara.
         if _looks_like_connection_error(str(exc)):
             raise RuntimeError(
